@@ -58,13 +58,18 @@ async function placesOf($: EngineInterface) {
   return { root: await $.session.root().catch(() => undefined), home: await homeOf($).catch(() => undefined) }
 }
 
+/** Claude Code's user folder: `$CLAUDE_CONFIG_DIR`, else `~/.claude`. */
+async function userDirOf($: EngineInterface): Promise<string | undefined> {
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = await homeOf($)
+  return configDir ?? (home === undefined ? undefined : `${home.replace(/[\\/]$/, '')}/.claude`)
+}
+
 /** The instruction files on disk where new ones can appear: user-level and the project's ancestors. */
 async function discover($: EngineInterface): Promise<PinnedFile[]> {
   const found: PinnedFile[] = []
 
-  const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
-  const home = await homeOf($)
-  const userDir = configDir ?? (home === undefined ? undefined : `${home.replace(/[\\/]$/, '')}/.claude`)
+  const userDir = await userDirOf($)
   if (userDir !== undefined) {
     const path = `${userDir}/CLAUDE.md`
     const mtimeMs = await mtimeOf($, path)
@@ -85,16 +90,47 @@ async function discover($: EngineInterface): Promise<PinnedFile[]> {
   return found
 }
 
-function report($: EngineInterface, pin: Pin) {
+/** The status line's text. */
+function statusOf(pin: Pin): string {
   const count = countOf(pin)
-  $.ui.status(count === 0 ? 'No CLAUDE.md found' : `CLAUDE.md pinned, ${count} ${count === 1 ? 'file' : 'files'}`)
+  return count === 0 ? 'No CLAUDE.md found' : `CLAUDE.md pinned, ${count} ${count === 1 ? 'file' : 'files'}`
 }
 
-/** Stores a new pin and says so: status line, compaction flag, and the pane's last change. */
+/**
+ * The plugin's own files in Claude Code's store, one per place it was installed from
+ * (`always-read-claudemd_<source>-<hash>.json`). A choice made in any chat is written there, so
+ * every chat watches them. A fresh install has none until something is kept, so one is kept first.
+ */
+async function storeFiles($: EngineInterface): Promise<string[]> {
+  const userDir = await userDirOf($)
+  if (userDir === undefined) return []
+  const dir = `${userDir}/plugins/store`
+  const list = async () =>
+    (await $.fs.list(dir).catch(() => []))
+      .filter(f => f.name.startsWith(`${PANE}_`) && f.name.endsWith('.json'))
+      .map(f => `${dir}/${f.name}`)
+  const files = await list()
+  if (files.length > 0) return files
+  await $.store.set(BAND_KEY, await read($, bandAtom))
+  return list()
+}
+
+/** Whether a path is one of the plugin's store files, in either slash and any case, as Windows allows. */
+const isStoreFile = (path: string) => /\/plugins\/store\/always-read-claudemd_[^/]*\.json$/.test(keyOf(path))
+
+/** Whether a path is an instruction file by its name: CLAUDE.md or CLAUDE.local.md. */
+const isInstructionFile = (path: string) => /(^|\/)claude(\.local)?\.md$/.test(keyOf(path))
+
+/** Shows or hides the band as it was last chosen, in this chat or another. */
+async function followBand($: EngineInterface) {
+  const stored = await $.store.get(BAND_KEY).catch(() => undefined)
+  if (typeof stored === 'boolean' && stored !== (await read($, bandAtom))) await update($, bandAtom, () => stored)
+}
+
+/** Stores a new pin and says so: compaction flag, the pane's last change, and the tab title. */
 async function settle($: EngineInterface, pin: Pin, change?: string) {
   await update($, pinAtom, () => pin)
   isPinned = render(pin) !== null
-  report($, pin)
   if (change !== undefined) {
     const turn = await read($, turnAtom)
     await update($, changeAtom, () => ({ text: change, turn }))
@@ -295,11 +331,30 @@ export const register: Register = on => {
       name: COMMAND,
       description: 'Show what CLAUDE.md is pinned in the system prompt; "/claudemd band" shows or hides the band',
     }).catch(() => undefined)
-    const stored = await $.store.get(BAND_KEY).catch(() => undefined)
-    if (typeof stored === 'boolean') await update($, bandAtom, () => stored)
+    // An older version pinned its status among the engine's notices; the line lives under the prompt now.
+    $.ui.status(undefined)
+    await followBand($)
     await sync($, { force: true }).catch(() => undefined)
 
     return started
+  })
+
+  // Every chat watches the plugin's store files and the CLAUDE.md files it pins, so a choice made in
+  // another chat, or a file edited anywhere, shows in each open chat at once, not at its next message.
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    const pinned = (await read($, pinAtom)).files.map(f => f.path)
+    const found = (await discover($).catch(() => [])).map(f => f.path)
+    const files = [...(await storeFiles($).catch(() => [])), ...pinned, ...found]
+    const watched = files.filter((path, i) => files.findIndex(p => keyOf(p) === keyOf(path)) === i)
+    return watched.length === 0 ? result : { ...result, watchPaths: [...(result.watchPaths ?? []), ...watched] }
+  })
+
+  // Known by name, so a hot reload (which keeps the watch but forgets the module's variables) still hears it.
+  on('classic.FileChanged', ($, e, next) => {
+    if (isStoreFile(e.file_path)) void followBand($).catch(() => undefined)
+    else if (isInstructionFile(e.file_path)) void sync($, { force: true }).catch(() => undefined)
+    return next(e)
   })
 
   // Answers with toasts and the pane alone: nothing is written to the chat.
@@ -389,6 +444,30 @@ export const register: Register = on => {
     if (!isPinned) return next(e)
 
     return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${COMPACT_NOTE}` : COMPACT_NOTE })
+  })
+
+  // The status line: a row of its own under the hint line below the prompt, which only the terminal
+  // draws. ($.ui.status would pin it above, among the engine's notices, under a warning sign.)
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const hint = await next(e)
+    if (e.surface !== 'terminal') return hint
+    const { Box, Text } = $.ui.resolve(e)
+    const pin = await read($, pinAtom)
+    const count = countOf(pin)
+
+    return (
+      <Box flexDirection="column">
+        {hint}
+        <Box key="status" flexDirection="row" columnGap={1}>
+          <Box flexShrink={0}>{count === 0 ? <Text dimColor>○</Text> : <Text color="success">●</Text>}</Box>
+          <Box flexShrink={1} minWidth={0}>
+            <Text dimColor wrap="truncate-end">
+              {statusOf(pin)}
+            </Text>
+          </Box>
+        </Box>
+      </Box>
+    )
   })
 
   // The band above the prompt: one quiet line, shown until hidden, beneath any other plugin's band.
