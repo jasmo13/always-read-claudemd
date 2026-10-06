@@ -1,0 +1,8 @@
+{
+  "name": "always-read-claudemd",
+  "version": "0.1.0",
+  "description": "Pins your CLAUDE.md into the system prompt so its rules survive compaction and are re-synced before every model request.",
+  "author": { "name": "Jake Campbell" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
