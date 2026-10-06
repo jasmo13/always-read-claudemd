@@ -406,6 +406,9 @@ test('the band shows what is pinned and hides; the pane lists each file and brin
     expect(await pane.find({ text: 'api/CLAUDE.md' })).toBeDefined()
     expect(await pane.find({ text: /^Unpins after 10 more messages/ })).toBeDefined()
     expect(await band.find({ text: 'api/ unpins in 10' })).toBeDefined()
+    // Keys no other band here uses: usage-mod's menu takes c, d, h, m and s.
+    expect((await band.find({ key: 'details' }))?.props.hotkey).toBe('o')
+    expect((await band.find({ key: 'hide' }))?.props.hotkey).toBe('x')
 
     await band.press({ key: 'hide' })
     expect(await band.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
@@ -664,6 +667,31 @@ test('the status line sits under the hint line below the prompt, in the terminal
   }
   // Never pinned among the engine's notices, where it would sit above the mode line under a warning sign.
   expect(statuses.filter(s => s !== undefined)).toEqual([])
+})
+
+test('hiding the band hides the status line too, and showing it brings both back', async ($, on) => {
+  world(on, { [PROJECT_MD]: 'Use tabs.' }, 17_500_000)
+  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
+    const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...HINT })
+    expect(await hint.find({ text: 'CLAUDE.md pinned, 1 file' })).toBeDefined()
+
+    await band.press({ key: 'hide' })
+    expect(await hint.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
+
+    await $.command.run({
+      command: 'claudemd',
+      args: 'band',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 120 },
+    })
+    expect(await hint.find({ text: 'CLAUDE.md pinned, 1 file' })).toBeDefined()
+    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
+    await band.unmount()
+    await hint.unmount()
+  }
 })
 
 test("another chat's band choice and an edited CLAUDE.md show here as soon as the files change", async ($, on) => {

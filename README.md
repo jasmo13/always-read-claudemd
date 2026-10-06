@@ -20,7 +20,7 @@ The system prompt is sent with every request and is never summarized. This plugi
 | Claude opens a file in a subfolder with its own `CLAUDE.md` | It pins that subfolder's file too, marked *apply when working in &lt;folder&gt;*, and shows a toast: *CLAUDE.md pinned: api/CLAUDE.md*. |
 | 10 of your messages pass with no work in that subfolder | It unpins the subfolder's file and shows a toast: *CLAUDE.md unpinned: api/CLAUDE.md*. Opening a file there again pins it again. |
 
-In the terminal, a status line under the prompt, below the mode line, shows *CLAUDE.md pinned, N files* while it is active. The desktop app has no line there, so the band says it instead.
+In the terminal, a status line under the prompt, below the mode line, shows *CLAUDE.md pinned, N files* while it is active. It hides and shows with the band. The desktop app has no line there, so the band says it instead.
 
 ### Where it looks for files
 
@@ -41,13 +41,15 @@ Both use your theme's own colors, so they look right in light and dark themes, i
 **The band** is one line above the prompt, shown in every chat until you hide it:
 
 ```
-● CLAUDE.md pinned  4 files, ~1.2k tokens  api/ unpins in 3  web/ unpins in 7  d: Details  h: Hide
+● CLAUDE.md pinned  4 files, ~1.2k tokens  api/ unpins in 3  web/ unpins in 7  o: Details  x: Hide
 ```
 
 Each subfolder file has its own count of messages left before it's unpinned. The band names the two closest to being unpinned, and adds *+N more* when there are others. The pane lists them all.
 
-- **Details** (`d`) opens the pane.
-- **Hide** (`h`) hides the band.
+- **Details** (`o`) opens the pane.
+- **Hide** (`x`) hides the band.
+
+These keys work while the band is focused, with a click or `ctrl+x tab`. They differ from the keys in usage-mod's band menu, so the two bands never fight over a key.
 
 If other plugins also draw bands above the prompt, they're all shown. This one comes last, next to the prompt, with a blank row and a line separating it from theirs.
 
@@ -82,7 +84,7 @@ Press a file's name to read it, or its number (`1`–`9`) in the terminal. The p
 
 `/claudemd` only opens the pane when it's closed. If it's already open, it stays as it is, so a file you're reading isn't closed. Pinning runs in the background either way.
 
-The plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are re-checked before every request. **Hide band** (`h`) / **Show band** (`s`) hides or shows the band, and so does `/claudemd band`. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
+The plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are re-checked before every request. **Hide band** (`h`) / **Show band** (`s`) hides or shows the band, and the status line under the prompt with it. So does `/claudemd band`. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
 
 ## Installing
 
