@@ -18,6 +18,8 @@ const LOCAL_MD = `${PROJECT}/CLAUDE.local.md`
 const USER_MD = `${HOME}/.claude/CLAUDE.md`
 const API_MD = `${PROJECT}/api/CLAUDE.md`
 const API_FILE = `${PROJECT}/api/orders.ts`
+// The plugin's file in Claude Code's store, which every chat watches.
+const STORE_FILE = `${HOME}/.claude/plugins/store/always-read-claudemd_inline-abc123.json`
 const SECTION_ID = 'always-read-claudemd:claudemd'
 
 const COMPOSE = {
@@ -77,9 +79,24 @@ function world(on: On, files: Record<string, string>, now: number) {
     )
     return { value: found } as never
   })
+  on('fs.list', (_$, e) => {
+    const dir = `${keyOf(e.path)}/`
+    const names = [...disk.values()].flatMap(f => {
+      const rest = keyOf(f.path).startsWith(dir) ? f.path.slice(dir.length) : ''
+      return rest === '' || rest.includes('/') ? [] : [{ name: rest, kind: 'file' }]
+    })
+    return { value: names } as never
+  })
   on('session.root', () => ({ value: PROJECT }) as never)
   mock.env(on, { USERPROFILE: HOME })
-  mock.store(on)
+  // The plugin's store, shared by every chat: a write lands in its file on disk.
+  const stored = new Map<string, unknown>()
+  on('store.get', (_$, e) => ({ value: stored.get(e.key) }) as never)
+  on('store.set', (_$, e) => {
+    stored.set(e.key, e.value)
+    write(STORE_FILE, JSON.stringify(Object.fromEntries(stored)))
+    return { value: undefined } as never
+  })
   // What the engine draws where the plugin draws nothing: an empty box.
   on('ui.render', ($, e) => {
     const { Box } = $.ui.resolve(e)
@@ -98,7 +115,7 @@ function world(on: On, files: Record<string, string>, now: number) {
     return { value: undefined } as never
   })
 
-  return { clock, statuses, toasts, write, remove }
+  return { clock, statuses, stored, toasts, write, remove }
 }
 
 /**
@@ -135,6 +152,7 @@ const BAND = {
     view: {},
   },
 } as const
+const HINT = { component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } } as const
 const PANE = {
   component: 'Pane',
   requestId: 'always-read-claudemd',
@@ -174,14 +192,16 @@ test('pins what is on disk when the system prompt renders before the context', a
 })
 
 test('with no CLAUDE.md anywhere it adds nothing and leaves the context alone', async ($, on) => {
-  const { statuses } = world(on, {}, 3_000_000)
+  world(on, {}, 3_000_000)
   const input = engine(on, null)
 
   const context = await $.prompt.context(input)
   expect(context.blocks.map(b => b.name)).toEqual(['currentDate'])
   const { sections } = await $.prompt.compose(COMPOSE)
   expect(sections.map(s => s.id)).toEqual(['intro'])
-  expect(statuses[statuses.length - 1]).toBe('No CLAUDE.md found')
+  const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...HINT })
+  expect(await hint.find({ text: 'No CLAUDE.md found' })).toBeDefined()
+  await hint.unmount()
 })
 
 test('re-syncs edits, new files and deletions made outside Claude Code', async ($, on) => {
@@ -624,4 +644,66 @@ test('the band drops what does not fit: a folder first, then the summary, then t
   // With no subfolder files, only the summary is at stake.
   expect(bandLayout(120, { ...parts, folders: [] })).toEqual({ folders: 0, hasSummary: true })
   expect(bandLayout(30, { ...parts, folders: [] })).toEqual({ folders: 0, hasSummary: false })
+})
+
+test('the status line sits under the hint line below the prompt, in the terminal', async ($, on) => {
+  const { statuses } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 17_000_000)
+  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...HINT })
+    const line = await hint.find({ text: 'CLAUDE.md pinned, 1 file' })
+    if (surface === 'terminal') {
+      expect(line).toBeDefined()
+      expect((await hint.findAll({ type: 'Text' })).find(t => t.text === '●')?.props.color).toBe('success')
+    } else {
+      // Only the terminal draws a line there; the desktop has the band.
+      expect(line).toBeUndefined()
+    }
+    await hint.unmount()
+  }
+  // Never pinned among the engine's notices, where it would sit above the mode line under a warning sign.
+  expect(statuses.filter(s => s !== undefined)).toEqual([])
+})
+
+test("another chat's band choice and an edited CLAUDE.md show here as soon as the files change", async ($, on) => {
+  on('classic.SessionStart', () => ({}))
+  on('classic.FileChanged', () => ({}))
+  const { clock, stored, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 18_000_000)
+  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
+  const changed = (path: string) =>
+    $.classic.FileChanged({ session_id: 's1', transcript_path: '', cwd: PROJECT, hook_event_name: 'FileChanged', file_path: path, event: 'change' } as never)
+
+  // A fresh install keeps its choice first, so there is a store file to watch, beside the pinned files.
+  const started = await $.classic.SessionStart({
+    session_id: 's1',
+    transcript_path: '',
+    cwd: PROJECT,
+    hook_event_name: 'SessionStart',
+    source: 'startup',
+  } as never)
+  expect(started.watchPaths).toEqual([STORE_FILE, PROJECT_MD])
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
+    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
+
+    // Another chat hides the band: its write changes the store file, reported in Windows' spelling.
+    stored.set('isBandShown', false)
+    await changed(STORE_FILE.replace(/\//g, '\\').toUpperCase())
+    await clock.advance(10)
+    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeUndefined()
+    stored.set('isBandShown', true)
+    await changed(STORE_FILE)
+    await clock.advance(10)
+    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
+    await band.unmount()
+  }
+
+  // A CLAUDE.md edited anywhere is pinned again at once, not at this chat's next message.
+  write(PROJECT_MD, 'Use spaces.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(toasts).toContain('CLAUDE.md changed: re-pinned')
+  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Use spaces.')
 })
