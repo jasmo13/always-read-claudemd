@@ -448,9 +448,10 @@ export const register: Register = on => {
 
   // The status line: a row of its own under the hint line below the prompt, which only the terminal
   // draws. ($.ui.status would pin it above, among the engine's notices, under a warning sign.)
+  // It hides and shows with the band, so hiding the band hides every sign of the plugin.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const hint = await next(e)
-    if (e.surface !== 'terminal') return hint
+    if (e.surface !== 'terminal' || !(await read($, bandAtom))) return hint
     const { Box, Text } = $.ui.resolve(e)
     const pin = await read($, pinAtom)
     const count = countOf(pin)
@@ -544,8 +545,8 @@ export const register: Register = on => {
             </Box>
           )}
           <Box flexDirection="row" columnGap={2} flexShrink={0}>
-            <Button key="details" label="Details" hotkey="d" plain dimColor onPress={() => void openPane($)} />
-            <Button key="hide" label="Hide" hotkey="h" plain dimColor onPress={() => setBand($, false)} />
+            <Button key="details" label="Details" hotkey="o" plain dimColor onPress={() => void openPane($)} />
+            <Button key="hide" label="Hide" hotkey="x" plain dimColor onPress={() => setBand($, false)} />
           </Box>
         </Box>
       </Box>
