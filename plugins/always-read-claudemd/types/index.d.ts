@@ -8,6 +8,13 @@ export type PinnedFile = {
   content: string
   /** Last modification seen, ms since the epoch; -1 when not yet stat'd. */
   mtimeMs: number
+  /**
+   * For a subfolder's CLAUDE.md, pinned once Claude worked in it: the folder
+   * it applies to. Absent for the files loaded at startup.
+   */
+  scope?: string
+  /** For a subfolder's file: the user message count when Claude last worked in its folder. */
+  lastUsedTurn?: number
 }
 
 /**
@@ -22,8 +29,18 @@ export type Pin = {
   source: 'engine' | 'discovered' | 'raw' | null
 }
 
+/** The latest change to what is pinned, as the pane words it. */
+export type PinChange = { text: string; turn: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'always-read-claudemd': { pin: Pin; checkedAt: number | null }
+    'always-read-claudemd': {
+      pin: Pin
+      checkedAt: number | null
+      /** User messages sent this session; subfolder pins age by it. */
+      turn: number
+      lastChange: PinChange | null
+      isBandShown: boolean
+    }
   }
 }
