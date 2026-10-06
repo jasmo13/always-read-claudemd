@@ -15,11 +15,11 @@ The system prompt is sent with every request and is never summarized. This plugi
 | Conversation starts | The plugin captures the `CLAUDE.md` block Claude Code built (every tier: managed, user `~/.claude/CLAUDE.md`, project, `CLAUDE.local.md`, auto-memory, `@imports`). It removes that block from the first message and pins it at the end of the system prompt instead, so nothing is duplicated. |
 | Before **every** model request | It re-checks the files on disk, at most once a second. Edits, newly created files and deletions are picked up at Claude's next step, even partway through a turn. It shows a toast: *CLAUDE.md changed: re-pinned*. |
 | Compaction (`/compact` or auto) | It tells the summarizer the rules are pinned and still in force, and asks it to keep any decisions or exceptions about them verbatim. Anything you typed after `/compact` stays first. |
-| No `CLAUDE.md` anywhere | It does nothing and adds no tokens. The status line reads *CLAUDE.md: none found*. |
+| No `CLAUDE.md` anywhere | It does nothing and adds no tokens. The status line reads *No CLAUDE.md found*. |
 | Claude opens a file in a subfolder with its own `CLAUDE.md` | It pins that subfolder's file too, marked *apply when working in &lt;folder&gt;*, and shows a toast: *CLAUDE.md pinned: api/CLAUDE.md*. |
 | 10 of your messages pass with no work in that subfolder | It unpins the subfolder's file and shows a toast: *CLAUDE.md unpinned: api/CLAUDE.md*. Opening a file there again pins it again. |
 
-The status line shows *CLAUDE.md pinned · N files* while it is active.
+The status line shows *CLAUDE.md pinned, N files* while it is active.
 
 ### Where it looks for files
 
@@ -35,28 +35,53 @@ Claude Code also adds the subfolder's file to the conversation by itself when Cl
 
 ## The band and the pane
 
+Both use your theme's own colors, so they look right in light and dark themes, in the terminal and the desktop app. Color only ever means something: a green dot when files are pinned, and a warning color when a subfolder file is 3 messages or fewer from being unpinned.
+
 **The band** is one line above the prompt, shown in every chat until you hide it:
 
 ```
-CLAUDE.md pinned · 4 files · ~1.2k tokens · api unpins in 7      [ Details ] [ Hide ]
+● CLAUDE.md pinned  4 files, ~1.2k tokens  api/ unpins in 3  web/ unpins in 7  d: Details  h: Hide
 ```
+
+Each subfolder file has its own count of messages left before it's unpinned. The band names the two closest to being unpinned, and adds *+N more* when there are others. The pane lists them all.
 
 - **Details** (`d`) opens the pane.
 - **Hide** (`h`) hides the band.
 
-**The pane** opens with `/claudemd`. It shows:
+If other plugins also draw bands above the prompt, they're all shown. This one comes last, next to the prompt, with a blank row and a line separating it from theirs.
 
-- how many files are pinned and roughly how many tokens they take up
-- each file's path, tier (user, project, local, managed, memory or subfolder) and size
-- for subfolder files, how many more messages before they're unpinned
-- the last change: what was edited, added, removed, pinned or unpinned
+**The pane** opens with `/claudemd`:
 
-It has two buttons:
+```
+● 2 files pinned  ~376 tokens                  h: Hide band
+───────────────────────────────────────────────────────────
+Kept in sync with disk. Press a file to read it.
 
-- **Show band** / **Hide band** (`b`)
-- **Check now** (`c`), which re-reads the files on disk straight away
+Loaded at startup
+1: CLAUDE.md                                           ~114
+   This project, shared with the team
 
-`/claudemd band` also shows or hides the band. Your choice is kept for every chat, new or old, until you change it.
+Subfolders
+2: plugins/always-read-claudemd/hooks/CLAUDE.md         ~87
+   Unpins after 10 more messages without work here
+
+Last change
+Pinned plugins/always-read-claudemd/hooks/CLAUDE.md   this message
+```
+
+In the terminal, everything above the line stays put and everything under it scrolls with the mouse wheel or the page keys, so a long file never pushes the band button out of sight. A scroll bar on the right shows where you are, whenever there's more than fits. The desktop app scrolls the pane itself, with its own scroll bar, so there the whole pane scrolls, top included. So that you always know which file is open, its name and size go in the pane's tab title, such as *hooks/CLAUDE.md, ~87 tokens*. Both leave a margin between the text and the pane's edges.
+
+The pane's frame and background come from Claude Code's theme. If the pane looks dark in a light terminal, choose a light theme with `/theme`.
+
+- **Loaded at startup** lists the files Claude Code loaded when the chat began, each with where it comes from: yours for every project, this project's shared file, your private one for this project, your organization's policy or auto memory.
+- **Subfolders** lists the subfolder files, each with how many more messages before it's unpinned.
+- **Last change** is what was last edited, added, removed, pinned or unpinned, and when.
+
+Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, exactly as it's pinned now, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
+
+`/claudemd` only opens the pane when it's closed. If it's already open, it stays as it is, so a file you're reading isn't closed. Pinning runs in the background either way.
+
+The plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are re-checked before every request. **Hide band** (`h`) / **Show band** (`s`) hides or shows the band, and so does `/claudemd band`. Your choice is kept for every chat, new or old, until you change it.
 
 ## Installing
 
@@ -70,7 +95,7 @@ claude plugin marketplace add jasmo13/always-read-claudemd
 claude plugin install always-read-claudemd@always-read-claudemd
 ```
 
-Then open a new chat, or restart the desktop app. The status line shows *CLAUDE.md pinned · N files*. You need to be able to read this repository on GitHub. While it's private, that means being signed in to GitHub as someone with access, the same as for `git clone`.
+Then open a new chat, or restart the desktop app. The status line shows *CLAUDE.md pinned, N files*. You need to be able to read this repository on GitHub. While it's private, that means being signed in to GitHub as someone with access, the same as for `git clone`.
 
 To try it from a local copy in the terminal without installing:
 

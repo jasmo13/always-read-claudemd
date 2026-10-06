@@ -41,6 +41,10 @@ declare module 'claude-code' {
       turn: number
       lastChange: PinChange | null
       isBandShown: boolean
+      /** The file the pane shows read-only (its path, or `raw` for rewritten text); null for the list. */
+      viewing: string | null
+      /** How many rows the pane's body is scrolled, under its fixed toolbar. */
+      paneTop: number
     }
   }
 }

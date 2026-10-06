@@ -18,13 +18,13 @@ const LABELS: Record<string, string> = {
   memory: "user's auto-memory, persists across conversations",
 }
 
-// Short tier names for the pane and band.
+// What each tier is, as the pane words it for the person.
 export const TIERS: Record<string, string> = {
-  managed: 'managed',
-  user: 'user',
-  project: 'project',
-  local: 'local',
-  memory: 'memory',
+  managed: "Your organization's policy",
+  user: 'Yours, for every project',
+  project: 'This project, shared with the team',
+  local: 'This project, only on your machine',
+  memory: 'Auto memory',
 }
 
 const HEADER = [
@@ -92,14 +92,70 @@ export function messagesLeft(file: PinnedFile, turn: number): number {
   return Math.max(0, UNPIN_AFTER - (turn - (file.lastUsedTurn ?? turn)))
 }
 
-/** A path as the pane shows it: relative to the project, `~` for the home folder, else whole. */
+/** A path as the pane shows it, with forward slashes: relative to the project, `~` for the home folder, else whole. */
 export function displayPath(path: string, places: { root?: string; home?: string }): string {
   const { root, home } = places
-  if (root !== undefined && root !== '' && isInside(path, root) && keyOf(path) !== keyOf(root)) {
-    return path.slice(root.replace(/[\\/]+$/, '').length + 1)
-  }
-  if (home !== undefined && home !== '' && isInside(path, home)) {
-    return `~${path.slice(home.replace(/[\\/]+$/, '').length)}`
-  }
-  return path
+  const shown =
+    root !== undefined && root !== '' && isInside(path, root) && keyOf(path) !== keyOf(root)
+      ? path.slice(root.replace(/[\\/]+$/, '').length + 1)
+      : home !== undefined && home !== '' && isInside(path, home)
+        ? `~${path.slice(home.replace(/[\\/]+$/, '').length)}`
+        : path
+  return shown.replace(/\\/g, '/')
+}
+
+/** A folder's own name, as the band shows it: `api/` for `C:\work\app\api`. */
+export const folderName = (dir: string) => `${dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? dir}/`
+
+/** The pane's tab title while a file is open: its folder and name, as the pane shows the path, and its size. */
+export function tabTitle(shown: string, tokens: number): string {
+  return `${shown.split('/').slice(-2).join('/')}, ~${formatTokens(tokens)} tokens`
+}
+
+/** Where a scroll by `by` rows lands, kept between the top and the last row that can scroll into view. */
+export const scrolled = (top: number, by: number, max: number) => Math.max(0, Math.min(Math.max(0, max), top + by))
+
+/**
+ * A scroll bar `shown` rows tall for content `total` rows tall scrolled `top` rows: true where the
+ * thumb is. Null when everything fits, so there is nothing to scroll.
+ */
+export function scrollBar(shown: number, total: number, top: number): boolean[] | null {
+  if (shown < 1 || total <= shown) return null
+  const thumb = Math.max(1, Math.round((shown * shown) / total))
+  const start = Math.round(((shown - thumb) * Math.min(top, total - shown)) / (total - shown))
+  return Array.from({ length: shown }, (_, row) => row >= start && row < start + thumb)
+}
+
+/** Cells a row of texts takes, two apart. */
+const rowWidth = (texts: string[]) => texts.reduce((n, t) => n + t.length, 0) + 2 * Math.max(0, texts.length - 1)
+
+/**
+ * What the band fits in `columns`: how many subfolder counts it names (two, then one with the rest
+ * counted), and whether it keeps the file and token summary, dropped before the last folder.
+ */
+export function bandLayout(
+  columns: number,
+  parts: { status: string; summary: string; folders: string[]; buttons: number },
+): { folders: number; hasSummary: boolean } {
+  const n = parts.folders.length
+  const tries =
+    n === 0
+      ? [{ folders: 0, hasSummary: true }]
+      : [
+          { folders: Math.min(2, n), hasSummary: true },
+          { folders: 1, hasSummary: true },
+          { folders: 1, hasSummary: false },
+        ]
+  const fits = tries.find(({ folders, hasSummary }) => {
+    const more = n - folders
+    const texts = [
+      parts.status,
+      ...(hasSummary ? [parts.summary] : []),
+      ...parts.folders.slice(0, folders),
+      ...(more > 0 ? [`+${more} more`] : []),
+      'x'.repeat(parts.buttons),
+    ]
+    return rowWidth(texts) <= columns
+  })
+  return fits ?? { folders: 0, hasSummary: false }
 }
