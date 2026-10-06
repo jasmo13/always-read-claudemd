@@ -9,7 +9,7 @@ import type {
   UiPane,
 } from 'claude-code'
 
-import { bandLayout, isBlank, scrollBar, scrolled, tabTitle } from './pin'
+import { bandLayout, displayPath, isBlank, scrollBar, scrolled, tabTitle } from './pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'
@@ -153,6 +153,8 @@ const BAND = {
   },
 } as const
 const HINT = { component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } } as const
+// Where the pinned line is drawn: under the prompt in the terminal, as the band above it on the desktop.
+const LINE = { terminal: HINT, desktop: BAND } as const
 const PANE = {
   component: 'Pane',
   requestId: 'always-read-claudemd',
@@ -344,9 +346,9 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
   const both = await send(5)
   expect(both).toContain('Validate every endpoint.')
   expect(both).toContain('Keep pages accessible.')
-  // The band shows each one's own count, the one closest to unpinning first.
+  // The line shows each one's own count, the one closest to unpinning first.
   for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
     const counts = (await band.findAll({ type: 'Text' })).filter(t => /unpins in/.test(t.text ?? ''))
     expect(counts.map(t => t.text)).toEqual(['api/ unpins in 1', 'web/ unpins in 5'])
     // Each in its own color: the one about to unpin in the warning color, the other dim.
@@ -356,16 +358,18 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
     await band.unmount()
   }
 
-  // With more than two, the band names the two closest to unpinning and counts the rest.
+  // With more than two, the line names the two closest to unpinning and counts the rest.
   for (const dir of ['docs', 'lib']) await $.tool.call({ tool: 'Read', tool_use_id: dir, file_path: `${PROJECT}/${dir}/x.ts` })
   for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
     const texts = (await band.findAll({ type: 'Text' })).map(t => t.text)
     expect(texts.filter(t => /unpins in/.test(t))).toEqual(['api/ unpins in 1', 'web/ unpins in 5'])
     expect(texts).toContain('+2 more')
     await band.unmount()
 
-    // Narrow, it names one folder and counts the rest, and drops the file and token summary.
+    // The status line has no width to measure, so it's cut to fit instead.
+    if (surface === 'terminal') continue
+    // A narrow band names one folder and counts the rest, and drops the file and token summary.
     const NARROW = { ...BAND, props: { ...BAND.props, bodyColumns: 80 } }
     const narrow = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...NARROW })
     const shown = (await narrow.findAll({ type: 'Text' })).map(t => t.text)
@@ -387,7 +391,7 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
   expect(await send(20)).toContain('Use tabs.')
 })
 
-test('the band shows what is pinned and hides; the pane lists each file and brings the band back', async ($, on) => {
+test('the line shows what is pinned and hides; the pane lists each file and brings the line back', async ($, on) => {
   world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 10_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
   tools(on)
@@ -395,28 +399,38 @@ test('the band shows what is pinned and hides; the pane lists each file and brin
   await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
-    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
-    expect(await band.find({ text: /^2 files, ~/ })).toBeDefined()
+    const line = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
+    expect(await line.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
+    expect(await line.find({ text: /^2 files, ~/ })).toBeDefined()
     // Alone, it has no rule above it.
-    expect(await band.find({ text: /^─+$/ })).toBeUndefined()
+    expect(await line.find({ text: /^─+$/ })).toBeUndefined()
 
     const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...PANE })
     expect(await pane.find({ text: /CLAUDE\.md$/ })).toBeDefined()
-    expect(await pane.find({ text: 'api/CLAUDE.md' })).toBeDefined()
+    // Each file by where it is, so a project's file says which project.
+    expect(await pane.find({ text: `${PROJECT}/api/CLAUDE.md` })).toBeDefined()
     expect(await pane.find({ text: /^Unpins after 10 more messages/ })).toBeDefined()
-    expect(await band.find({ text: 'api/ unpins in 10' })).toBeDefined()
-    // Keys no other band here uses: usage-mod's menu takes c, d, h, m and s.
-    expect((await band.find({ key: 'details' }))?.props.hotkey).toBe('o')
-    expect((await band.find({ key: 'hide' }))?.props.hotkey).toBe('x')
+    expect(await line.find({ text: 'api/ unpins in 10' })).toBeDefined()
 
-    await band.press({ key: 'hide' })
-    expect(await band.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
-    expect(await pane.find({ key: 'band', text: 'Show band' })).toBeDefined()
+    // The pane's button names the line as it's drawn there.
+    const name = surface === 'terminal' ? 'status line' : 'band'
+    if (surface === 'desktop') {
+      // Keys no other band here uses: usage-mod's menu takes c, d, h, m and s.
+      expect((await line.find({ key: 'details' }))?.props.hotkey).toBe('o')
+      expect((await line.find({ key: 'hide' }))?.props.hotkey).toBe('x')
+      await line.press({ key: 'hide' })
+    } else {
+      // The status line has no buttons: the pane and /claudemd show and hide it.
+      expect(await line.find({ type: 'Button' })).toBeUndefined()
+      await pane.press({ key: 'band' })
+    }
+    expect(await line.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
+    expect(await pane.find({ key: 'band', text: `Show ${name}` })).toBeDefined()
 
     await pane.press({ key: 'band' })
-    expect(await band.find({ text: /CLAUDE\.md pinned/ })).toBeDefined()
-    await band.unmount()
+    expect(await line.find({ text: /CLAUDE\.md pinned/ })).toBeDefined()
+    expect(await pane.find({ key: 'band', text: `Hide ${name}` })).toBeDefined()
+    await line.unmount()
     await pane.unmount()
   }
 })
@@ -438,7 +452,7 @@ test('the pane opens a file read-only and goes back to the list', async ($, on) 
   }
 })
 
-test('/claudemd opens the pane on the list, and leaves an open pane as it is', async ($, on) => {
+test('/claudemd opens the pane on the list, and closes it when it is open', async ($, on) => {
   // The panes Claude Code has open, as the engine would list them.
   const panes: UiPane[] = []
   on('ui.open', (_$, e) => {
@@ -446,6 +460,11 @@ test('/claudemd opens the pane on the list, and leaves an open pane as it is', a
       panes.push({ id: e.id, title: e.title ?? '', isShown: true, isFocused: true, isPlaced: true })
     }
     return { value: { isPlaced: true } } as never
+  })
+  on('ui.close', (_$, e) => {
+    const at = panes.findIndex(p => p.id === e.id)
+    if (at >= 0) panes.splice(at, 1)
+    return { value: undefined } as never
   })
   on('ui.panes', () => ({ value: [...panes] }) as never)
   world(on, { [PROJECT_MD]: 'Use tabs.' }, 14_000_000)
@@ -463,8 +482,13 @@ test('/claudemd opens the pane on the list, and leaves an open pane as it is', a
 
   const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
   await pane.press({ key: `open:${keyOf(PROJECT_MD)}` })
-  await run()
   expect((await pane.find({ type: 'Markdown' }))?.text).toBe('Use tabs.')
+  // Run again, it closes the pane; once more, it opens it on the list.
+  expect((await run()).text).toBeUndefined()
+  expect(panes).toEqual([])
+  await run()
+  expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
+  expect(await pane.find({ type: 'Markdown' })).toBeUndefined()
   await pane.unmount()
 })
 
@@ -517,7 +541,7 @@ test('a long file scrolls under the toolbar, which stays put', async ($, on) => 
     expect(marks[0]?.props.color).toBe('text')
     expect(marks[7]?.props.color).toBe('subtle')
     expect(await pane.find({ key: 'back' })).toBeDefined()
-    expect(await pane.find({ key: 'band', text: 'Hide band' })).toBeDefined()
+    expect(await pane.find({ key: 'band', text: 'Hide status line' })).toBeDefined()
     await pane.press({ key: 'back' })
     await pane.unmount()
   }
@@ -538,7 +562,7 @@ test('a long file scrolls under the toolbar, which stays put', async ($, on) => 
   expect(thumb(scrollBar(10, 1000, 500)).length).toBe(1)
 })
 
-test("on the desktop the open file's name and size stay in the pane's tab title", async ($, on) => {
+test("on the desktop the open file's name, where it comes from and its size stay in the pane's tab title", async ($, on) => {
   // The pane Claude Code has open, retitled by each later open, as the engine would.
   const panes: UiPane[] = [{ id: 'always-read-claudemd', title: 'CLAUDE.md', isShown: true, isFocused: true, isPlaced: true }]
   const titles: string[] = []
@@ -568,20 +592,23 @@ test("on the desktop the open file's name and size stay in the pane's tab title"
   const boxes = await pane.findAll({ type: 'Box' })
   expect(boxes[0]?.props.height).toBeUndefined()
   expect(boxes.some(b => typeof b.props.marginTop === 'number' && b.props.marginTop < 0)).toBe(false)
-  expect(titles).toEqual(['CLAUDE.md, ~3 tokens'])
+  expect(titles).toEqual([`${PROJECT}/CLAUDE.md: This project, shared with the team (~3 tokens, read-only)`])
   await pane.press({ key: 'back' })
   expect(titles[titles.length - 1]).toBe('CLAUDE.md')
 
   // A subfolder file shows its folder; when it's unpinned, the pane goes back to the list and its title.
   await pane.press({ key: `open:${keyOf(API_MD)}` })
-  expect(titles[titles.length - 1]).toBe('api/CLAUDE.md, ~6 tokens')
+  expect(titles[titles.length - 1]).toBe(`${PROJECT}/api/CLAUDE.md: Applies while Claude works in api/ (~6 tokens, read-only)`)
   for (let i = 0; i < 10; i++) await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
   await clock.advance(1500)
   expect(titles[titles.length - 1]).toBe('CLAUDE.md')
   expect(await pane.find({ type: 'Markdown' })).toBeUndefined()
   await pane.unmount()
 
-  expect(tabTitle('~/.claude/CLAUDE.md', 1200)).toBe('.claude/CLAUDE.md, ~1.2k tokens')
+  expect(tabTitle('~/.claude/CLAUDE.md', 'Yours, for every project', 1200)).toBe('~/.claude/CLAUDE.md: Yours, for every project (~1.2k tokens, read-only)')
+  // Under the home folder, a file's location starts with ~, in forward slashes.
+  expect(displayPath('C:\\home\\proj\\CLAUDE.md', { home: HOME })).toBe('~/proj/CLAUDE.md')
+  expect(displayPath(`${PROJECT}/CLAUDE.md`, { home: HOME })).toBe(`${PROJECT}/CLAUDE.md`)
 })
 
 test('no rule is drawn for a band slot that draws nothing', () => {
@@ -592,7 +619,7 @@ test('no rule is drawn for a band slot that draws nothing', () => {
   expect(isBlank({ type: 'Box', props: {}, children: [{ type: 'Text', props: {}, children: ['Usage'] }] })).toBe(false)
 })
 
-test("the band keeps another plugin's band above it", async ($, on) => {
+test("the band keeps another plugin's band above it, and the terminal leaves theirs alone", async ($, on) => {
   // Another plugin's band, beneath this one in the chain.
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -601,30 +628,27 @@ test("the band keeps another plugin's band above it", async ($, on) => {
   world(on, { [PROJECT_MD]: 'Use tabs.' }, 12_000_000)
   await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
 
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
-    // Theirs first, then a rule, then this band last, at the bottom.
-    const texts = (await band.findAll({ type: 'Text' })).map(t => t.text)
-    const rule = texts.findIndex(t => /^─+$/.test(t))
-    expect(texts[rule]?.length).toBe(500)
-    expect(texts.indexOf('Usage: 42%')).toBe(0)
-    expect(rule).toBeGreaterThan(0)
-    expect(texts.indexOf('CLAUDE.md pinned')).toBeGreaterThan(rule)
+  // The terminal draws this line under the prompt, so above it there's theirs alone, with no rule.
+  const terminal = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...BAND })
+  expect((await terminal.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Usage: 42%'])
+  await terminal.unmount()
 
-    await band.press({ key: 'hide' })
-    expect(await band.find({ text: 'Usage: 42%' })).toBeDefined()
-    expect(await band.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
-    await $.command.run({
-      command: 'claudemd',
-      args: 'band',
-      origin: { kind: 'composer' },
-      presentation: { isFullscreen: false, columns: 120 },
-    })
-    await band.unmount()
-  }
+  const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'desktop', ...BAND })
+  // Theirs first, then a rule, then this band last, at the bottom.
+  const texts = (await band.findAll({ type: 'Text' })).map(t => t.text)
+  const rule = texts.findIndex(t => /^─+$/.test(t))
+  expect(texts[rule]?.length).toBe(500)
+  expect(texts.indexOf('Usage: 42%')).toBe(0)
+  expect(rule).toBeGreaterThan(0)
+  expect(texts.indexOf('CLAUDE.md pinned')).toBeGreaterThan(rule)
+
+  await band.press({ key: 'hide' })
+  expect(await band.find({ text: 'Usage: 42%' })).toBeDefined()
+  expect(await band.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
+  await band.unmount()
 })
 
-test('/claudemd band shows and hides the band', async ($, on) => {
+test('/claudemd band shows and hides the line', async ($, on) => {
   const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 11_000_000)
   await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
   const run = () =>
@@ -637,7 +661,7 @@ test('/claudemd band shows and hides the band', async ($, on) => {
 
   expect((await run()).text).toBeUndefined()
   expect((await run()).text).toBeUndefined()
-  expect(toasts.slice(-2)).toEqual(['CLAUDE.md band hidden', 'CLAUDE.md band shown'])
+  expect(toasts.slice(-2)).toEqual(['CLAUDE.md line hidden', 'CLAUDE.md line shown'])
 })
 
 test('the band drops what does not fit: a folder first, then the summary, then the last folder', () => {
@@ -657,49 +681,27 @@ test('the band drops what does not fit: a folder first, then the summary, then t
   expect(bandLayout(30, { ...parts, folders: [] })).toEqual({ folders: 0, hasSummary: false })
 })
 
-test('the status line sits under the hint line below the prompt, in the terminal', async ($, on) => {
+test('in the terminal the line sits under the hint line below the prompt, styled as the band', async ($, on) => {
   const { statuses } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 17_000_000)
   await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...HINT })
-    const line = await hint.find({ text: 'CLAUDE.md pinned, 1 file' })
+    const texts = await hint.findAll({ type: 'Text' })
+    const name = texts.find(t => t.text === 'CLAUDE.md pinned')
     if (surface === 'terminal') {
-      expect(line).toBeDefined()
-      expect((await hint.findAll({ type: 'Text' })).find(t => t.text === '●')?.props.color).toBe('success')
+      // A green dot, the name in the text color, and the summary in gray.
+      expect(texts.find(t => t.text === '●')?.props.color).toBe('success')
+      expect(name?.props.dimColor).toBe(false)
+      expect(texts.find(t => /^1 file, ~\d+ tokens$/.test(t.text ?? ''))?.props.dimColor).toBe(true)
     } else {
       // Only the terminal draws a line there; the desktop has the band.
-      expect(line).toBeUndefined()
+      expect(name).toBeUndefined()
     }
     await hint.unmount()
   }
   // Never pinned among the engine's notices, where it would sit above the mode line under a warning sign.
   expect(statuses.filter(s => s !== undefined)).toEqual([])
-})
-
-test('hiding the band hides the status line too, and showing it brings both back', async ($, on) => {
-  world(on, { [PROJECT_MD]: 'Use tabs.' }, 17_500_000)
-  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
-
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
-    const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...HINT })
-    expect(await hint.find({ text: 'CLAUDE.md pinned, 1 file' })).toBeDefined()
-
-    await band.press({ key: 'hide' })
-    expect(await hint.find({ text: /CLAUDE\.md pinned/ })).toBeUndefined()
-
-    await $.command.run({
-      command: 'claudemd',
-      args: 'band',
-      origin: { kind: 'composer' },
-      presentation: { isFullscreen: false, columns: 120 },
-    })
-    expect(await hint.find({ text: 'CLAUDE.md pinned, 1 file' })).toBeDefined()
-    expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
-    await band.unmount()
-    await hint.unmount()
-  }
 })
 
 test("another chat's band choice and an edited CLAUDE.md show here as soon as the files change", async ($, on) => {
@@ -721,7 +723,7 @@ test("another chat's band choice and an edited CLAUDE.md show here as soon as th
   expect(started.watchPaths).toEqual([STORE_FILE, PROJECT_MD])
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...BAND })
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
     expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
 
     // Another chat hides the band: its write changes the store file, reported in Windows' spelling.

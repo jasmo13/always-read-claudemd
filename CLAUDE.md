@@ -1,6 +1,6 @@
 # always-read-claudemd
 
-A Claude Code plugin that moves CLAUDE.md out of the conversation's first message and pins it in the system prompt, so its rules survive compaction. It also pins subfolder CLAUDE.md files while Claude works in them, and shows a band above the prompt and a `/claudemd` pane.
+A Claude Code plugin that moves CLAUDE.md out of the conversation's first message and pins it in the system prompt, so its rules survive compaction. It also pins subfolder CLAUDE.md files while Claude works in them, and shows a line saying what's pinned (under the prompt in the terminal, a band above it on the desktop) and a `/claudemd` pane.
 
 ## Working rules
 
@@ -49,11 +49,14 @@ A Claude Code plugin that moves CLAUDE.md out of the conversation's first messag
 
 `session.compact` is synchronous on purpose. It adds a note to the summarizer's instructions saying the rules are pinned and still in force, after anything the person typed after `/compact`.
 
-## The band and the pane
+## The line, the band and the pane
+
+- In the terminal, the line is a row under the hint line below the prompt (`PromptHint`), and the band hook passes. On the desktop, which draws no `PromptHint`, it's the band above the prompt.
+- The line and the band draw the same row, through `pinnedLine`. The band choice shows and hides both.
 
 - The band hook calls `next(e)` first and draws the other plugins' bands above its own line. The slot holds one tree, so returning without them would hide every other plugin's band.
 - The pane has a fixed toolbar and scrolls its own body under it, through a `ui.scroll` hook.
-- `/claudemd` opens the pane only when it's closed. An open pane is left as it is.
+- `/claudemd` opens the pane when it's closed and closes it when it's open. The terminal has no Details button, so the command is the way in and out.
 - The plugin never writes to the chat. Commands return no text, and everything it reports is a toast or the status line.
 
 ### Design rules

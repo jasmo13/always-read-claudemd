@@ -92,24 +92,22 @@ export function messagesLeft(file: PinnedFile, turn: number): number {
   return Math.max(0, UNPIN_AFTER - (turn - (file.lastUsedTurn ?? turn)))
 }
 
-/** A path as the pane shows it, with forward slashes: relative to the project, `~` for the home folder, else whole. */
-export function displayPath(path: string, places: { root?: string; home?: string }): string {
-  const { root, home } = places
-  const shown =
-    root !== undefined && root !== '' && isInside(path, root) && keyOf(path) !== keyOf(root)
-      ? path.slice(root.replace(/[\\/]+$/, '').length + 1)
-      : home !== undefined && home !== '' && isInside(path, home)
-        ? `~${path.slice(home.replace(/[\\/]+$/, '').length)}`
-        : path
+/**
+ * Where a file is, as the pane, its tab title and the toasts show it: the whole path, with `~` for
+ * the home folder and forward slashes, so a project's CLAUDE.md says which project it's in.
+ */
+export function displayPath(path: string, places: { home?: string }): string {
+  const { home } = places
+  const shown = home !== undefined && home !== '' && isInside(path, home) ? `~${path.slice(home.replace(/[\\/]+$/, '').length)}` : path
   return shown.replace(/\\/g, '/')
 }
 
 /** A folder's own name, as the band shows it: `api/` for `C:\work\app\api`. */
 export const folderName = (dir: string) => `${dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? dir}/`
 
-/** The pane's tab title while a file is open: its folder and name, as the pane shows the path, and its size. */
-export function tabTitle(shown: string, tokens: number): string {
-  return `${shown.split('/').slice(-2).join('/')}, ~${formatTokens(tokens)} tokens`
+/** The pane's tab title while a file is open: where it is, where it comes from, and its size. */
+export function tabTitle(shown: string, detail: string, tokens: number): string {
+  return `${shown}: ${detail} (~${formatTokens(tokens)} tokens, read-only)`
 }
 
 /** Where a scroll by `by` rows lands, kept between the top and the last row that can scroll into view. */
