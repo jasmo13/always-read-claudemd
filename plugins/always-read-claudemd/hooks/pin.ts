@@ -159,3 +159,13 @@ export function bandLayout(
   })
   return fits ?? { folders: 0, hasSummary: false }
 }
+
+// True for a tree that draws nothing. Beneath every band, the engine answers with a placeholder,
+// { type: 'engine' }, that draws nothing in this slot; empty Boxes and nulls draw nothing either.
+export function isBlank(node: unknown): boolean {
+  if (node === null || node === undefined || typeof node === 'boolean' || node === '') return true
+  if (Array.isArray(node)) return node.every(isBlank)
+  if (typeof node !== 'object') return false
+  const { type, children = [] } = node as { type?: string; children?: unknown[] }
+  return type === 'engine' || (type === 'Box' && children.every(isBlank))
+}
