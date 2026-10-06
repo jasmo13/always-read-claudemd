@@ -16,11 +16,9 @@ The system prompt is sent with every request and is never summarized. This plugi
 | Before **every** model request | It re-checks the files on disk, at most once a second. Edits, newly created files and deletions are picked up at Claude's next step, even partway through a turn. It shows a toast: *CLAUDE.md changed: re-pinned*. |
 | A pinned `CLAUDE.md` is edited, by anyone | Every open chat re-pins it at once, without waiting for its next message, and shows the same toast. |
 | Compaction (`/compact` or auto) | It tells the summarizer the rules are pinned and still in force, and asks it to keep any decisions or exceptions about them verbatim. Anything you typed after `/compact` stays first. |
-| No `CLAUDE.md` anywhere | It does nothing and adds no tokens. The status line reads *No CLAUDE.md found*. |
-| Claude opens a file in a subfolder with its own `CLAUDE.md` | It pins that subfolder's file too, marked *apply when working in &lt;folder&gt;*, and shows a toast: *CLAUDE.md pinned: api/CLAUDE.md*. |
-| 10 of your messages pass with no work in that subfolder | It unpins the subfolder's file and shows a toast: *CLAUDE.md unpinned: api/CLAUDE.md*. Opening a file there again pins it again. |
-
-In the terminal, a status line under the prompt, below the mode line, shows *CLAUDE.md pinned, N files* while it is active. It hides and shows with the band. The desktop app has no line there, so the band says it instead.
+| No `CLAUDE.md` anywhere | It does nothing and adds no tokens. Its line reads *No CLAUDE.md found*. |
+| Claude opens a file in a subfolder with its own `CLAUDE.md` | It pins that subfolder's file too, marked *apply when working in &lt;folder&gt;*, and shows a toast with where it is: *CLAUDE.md pinned: ~/app/api/CLAUDE.md*. |
+| 10 of your messages pass with no work in that subfolder | It unpins the subfolder's file and shows a toast: *CLAUDE.md unpinned: ~/app/api/CLAUDE.md*. Opening a file there again pins it again. |
 
 ### Where it looks for files
 
@@ -34,26 +32,30 @@ A subfolder's file stays pinned while Claude keeps working in that folder. Any t
 
 Claude Code also adds the subfolder's file to the conversation by itself when Claude first opens a file there. That copy is an ordinary message, so it can appear twice until the next compaction removes it.
 
-## The band and the pane
+## The line and the pane
 
 Both use your theme's own colors, so they look right in light and dark themes, in the terminal and the desktop app. Color only ever means something: a green dot when files are pinned, and a warning color when a subfolder file is 3 messages or fewer from being unpinned.
 
-**The band** is one line above the prompt, shown in every chat until you hide it:
+**The line** says what's pinned, in every chat until you hide it. *CLAUDE.md pinned* is in the text color, and the rest in gray:
 
 ```
-● CLAUDE.md pinned  4 files, ~1.2k tokens  api/ unpins in 3  web/ unpins in 7  o: Details  x: Hide
+● CLAUDE.md pinned  4 files, ~1.2k tokens  api/ unpins in 3  web/ unpins in 7
 ```
 
-Each subfolder file has its own count of messages left before it's unpinned. The band names the two closest to being unpinned, and adds *+N more* when there are others. The pane lists them all.
+Each subfolder file has its own count of messages left before it's unpinned. The line names the two closest to being unpinned, and adds *+N more* when there are others. The pane lists them all.
+
+In the terminal, it's the status line under the prompt, below the mode line, so nothing is added above the prompt. The rest of the row is cut off when the terminal is too narrow for it all. `/claudemd` opens and closes the pane.
+
+In the desktop app, which has no line under the prompt, it's a band above the prompt instead, with two buttons:
 
 - **Details** (`o`) opens the pane.
 - **Hide** (`x`) hides the band.
 
-These keys work while the band is focused, with a click or `ctrl+x tab`. They differ from the keys in usage-mod's band menu, so the two bands never fight over a key.
+These keys work while the band is focused, with a click or `ctrl+x tab`. They differ from the keys in usage-mod's band menu, so the two bands never fight over a key. On a narrow band, it names one subfolder file, then drops the file count and size.
 
 If other plugins also draw bands above the prompt, they're all shown. This one comes last, next to the prompt, with a blank row and a line separating it from theirs. With no other band, there's no line.
 
-**The pane** opens with `/claudemd`:
+**The pane** opens with `/claudemd`. In the desktop app:
 
 ```
 ● 2 files pinned  ~376 tokens                  h: Hide band
@@ -61,18 +63,18 @@ If other plugins also draw bands above the prompt, they're all shown. This one c
 Kept in sync with disk. Press a file to read it.
 
 Loaded at startup
-1: CLAUDE.md                                           ~114
+1: ~/app/CLAUDE.md                                     ~114
    This project, shared with the team
 
 Subfolders
-2: plugins/always-read-claudemd/hooks/CLAUDE.md         ~87
+2: ~/app/api/CLAUDE.md                                  ~87
    Unpins after 10 more messages without work here
 
 Last change
-Pinned plugins/always-read-claudemd/hooks/CLAUDE.md   this message
+Pinned ~/app/api/CLAUDE.md                     this message
 ```
 
-In the terminal, everything above the line stays put and everything under it scrolls with the mouse wheel or the page keys, so a long file never pushes the band button out of sight. A scroll bar on the right shows where you are, whenever there's more than fits. The desktop app scrolls the pane itself, with its own scroll bar, so there the whole pane scrolls, top included. So that you always know which file is open, its name and size go in the pane's tab title, such as *hooks/CLAUDE.md, ~87 tokens*. Both leave a margin between the text and the pane's edges.
+In the terminal, the button reads **Hide status line**. Everything above the rule stays put and everything under it scrolls with the mouse wheel or the page keys, so a long file never pushes that button out of sight. A scroll bar on the right shows where you are, whenever there's more than fits. The desktop app scrolls the pane itself, with its own scroll bar, so there the whole pane scrolls, top included. So that you always know which file is open, the pane's tab title names it, where it comes from and its size, such as *~/app/CLAUDE.md: This project, shared with the team (~1.7k tokens, read-only)*. Both leave a margin between the text and the pane's edges.
 
 The pane's frame and background come from Claude Code's theme. If the pane looks dark in a light terminal, choose a light theme with `/theme`.
 
@@ -80,11 +82,11 @@ The pane's frame and background come from Claude Code's theme. If the pane looks
 - **Subfolders** lists the subfolder files, each with how many more messages before it's unpinned.
 - **Last change** is what was last edited, added, removed, pinned or unpinned, and when.
 
-Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, exactly as it's pinned now, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
+Every file is named by where it is, with `~` for your home folder, so a project's file says which project it's in. Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, exactly as it's pinned now, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
 
-`/claudemd` only opens the pane when it's closed. If it's already open, it stays as it is, so a file you're reading isn't closed. Pinning runs in the background either way.
+`/claudemd` opens the pane, on the list of files, or closes it when it's open. Pinning runs in the background either way.
 
-The plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are re-checked before every request. **Hide band** (`h`) / **Show band** (`s`) hides or shows the band, and the status line under the prompt with it. So does `/claudemd band`. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
+The plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are re-checked before every request. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
 
 ## Installing
 
@@ -98,7 +100,7 @@ claude plugin marketplace add jasmo13/always-read-claudemd
 claude plugin install always-read-claudemd@always-read-claudemd
 ```
 
-Then open a new chat, or restart the desktop app. The band above the prompt shows *CLAUDE.md pinned*. You need to be able to read this repository on GitHub. While it's private, that means being signed in to GitHub as someone with access, the same as for `git clone`.
+Then open a new chat, or restart the desktop app. The line shows *CLAUDE.md pinned*: under the prompt in the terminal, above it in the desktop app. You need to be able to read this repository on GitHub. While it's private, that means being signed in to GitHub as someone with access, the same as for `git clone`.
 
 To try it from a local copy in the terminal without installing:
 

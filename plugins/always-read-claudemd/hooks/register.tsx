@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderElement } from 'claude-code'
+import type { ClientElements, EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type { Pin, PinnedFile } from '../types'
 import {
@@ -56,7 +56,7 @@ async function homeOf($: EngineInterface): Promise<string | undefined> {
 }
 
 async function placesOf($: EngineInterface) {
-  return { root: await $.session.root().catch(() => undefined), home: await homeOf($).catch(() => undefined) }
+  return { home: await homeOf($).catch(() => undefined) }
 }
 
 /** Claude Code's user folder: `$CLAUDE_CONFIG_DIR`, else `~/.claude`. */
@@ -91,10 +91,64 @@ async function discover($: EngineInterface): Promise<PinnedFile[]> {
   return found
 }
 
-/** The status line's text. */
-function statusOf(pin: Pin): string {
+/**
+ * What the band and the terminal's status line say: how many files are pinned and their size, and
+ * each subfolder file with its own count, the one closest to unpinning first.
+ */
+function lineOf(pin: Pin, turn: number) {
   const count = countOf(pin)
-  return count === 0 ? 'No CLAUDE.md found' : `CLAUDE.md pinned, ${count} ${count === 1 ? 'file' : 'files'}`
+  const summary = `${count} ${count === 1 ? 'file' : 'files'}, ~${formatTokens(tokensOf(render(pin) ?? ''))} tokens`
+  const nested = pin.files
+    .flatMap(f => (f.scope === undefined ? [] : [{ folder: folderName(f.scope), left: messagesLeft(f, turn) }]))
+    .sort((a, b) => a.left - b.left)
+  return { count, summary, nested }
+}
+
+/**
+ * The line itself, as the band and the status line both draw it: the dot, "CLAUDE.md pinned", the
+ * summary in gray, then the first `folders` subfolder files and how many more there are.
+ */
+function pinnedLine(
+  { Box, Text }: Pick<ClientElements, 'Box' | 'Text'>,
+  { count, summary, nested }: ReturnType<typeof lineOf>,
+  { folders, hasSummary }: { folders: number; hasSummary: boolean },
+): RenderElement[] {
+  const named = nested.slice(0, folders)
+  return [
+    <Box key="pinned" flexDirection="row" columnGap={1} flexGrow={1} flexShrink={1} minWidth={0}>
+      <Box flexShrink={0}>{count === 0 ? <Text dimColor>○</Text> : <Text color="success">●</Text>}</Box>
+      <Box flexShrink={0}>
+        <Text dimColor={count === 0}>{count === 0 ? 'No CLAUDE.md found' : 'CLAUDE.md pinned'}</Text>
+      </Box>
+      {count > 0 && hasSummary && (
+        <Box flexShrink={1} minWidth={0}>
+          <Text dimColor wrap="truncate-end">
+            {summary}
+          </Text>
+        </Box>
+      )}
+    </Box>,
+    ...(named.length === 0
+      ? []
+      : [
+          <Box key="folders" flexDirection="row" columnGap={2} flexShrink={0}>
+            {named.map(({ folder, left }) => (
+              <Box key={folder} flexShrink={0}>
+                {left <= NEAR_UNPIN ? (
+                  <Text color="warning">{`${folder} unpins in ${left}`}</Text>
+                ) : (
+                  <Text dimColor>{`${folder} unpins in ${left}`}</Text>
+                )}
+              </Box>
+            ))}
+            {nested.length > named.length && (
+              <Box key="more" flexShrink={0}>
+                <Text dimColor>{`+${nested.length - named.length} more`}</Text>
+              </Box>
+            )}
+          </Box>,
+        ]),
+  ]
 }
 
 /**
@@ -139,13 +193,24 @@ async function settle($: EngineInterface, pin: Pin, change?: string) {
   await settleView($, pin).catch(() => undefined)
 }
 
-/** The pane's tab title for what it shows: the open file's name and size, or the plain title. */
+/** Where a file comes from, as the open file's view and its tab title say it. */
+function detailOf(file: PinnedFile): string {
+  return file.scope === undefined ? (TIERS[file.kind] ?? file.kind) : `Applies while Claude works in ${folderName(file.scope)}`
+}
+const RAW_DETAIL = 'As another plugin rewrote it'
+
+/**
+ * The pane's tab title for what it shows: the open file's name, where it comes from, its size and
+ * that it's read-only, or the plain title.
+ */
 async function titleFor($: EngineInterface, viewing: string | null): Promise<string> {
   if (viewing === null) return TITLE
   const pin = await read($, pinAtom)
-  if (viewing === RAW && pin.source === 'raw') return tabTitle(TITLE, tokensOf(pin.raw ?? ''))
+  if (viewing === RAW && pin.source === 'raw') return tabTitle(TITLE, RAW_DETAIL, tokensOf(pin.raw ?? ''))
   const file = pin.files.find(f => keyOf(f.path) === viewing)
-  return file === undefined ? TITLE : tabTitle(displayPath(file.path, await placesOf($)), tokensOf(file.content))
+  return file === undefined
+    ? TITLE
+    : tabTitle(displayPath(file.path, await placesOf($)), detailOf(file), tokensOf(file.content))
 }
 
 /**
@@ -325,12 +390,19 @@ async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: TITLE })
 }
 
+// /claudemd: opens the pane, or closes it when it's open. The terminal has no band, so no Details
+// button; the command is the way in and out.
+async function togglePane($: EngineInterface) {
+  if ((await $.ui.panes()).some(pane => pane.id === PANE)) await $.ui.close({ id: PANE })
+  else await openPane($)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({
       name: COMMAND,
-      description: 'Show what CLAUDE.md is pinned in the system prompt; "/claudemd band" shows or hides the band',
+      description: 'Open or close the pane showing what CLAUDE.md is pinned; "/claudemd band" shows or hides its line',
     }).catch(() => undefined)
     // An older version pinned its status among the engine's notices; the line lives under the prompt now.
     $.ui.status(undefined)
@@ -363,10 +435,12 @@ export const register: Register = on => {
     if (e.args.trim().toLowerCase() === 'band') {
       const isShown = !(await read($, bandAtom))
       await setBand($, isShown)
-      $.ui.toast(isShown ? 'CLAUDE.md band shown' : 'CLAUDE.md band hidden')
+      // The terminal shows this line under the prompt, the desktop as the band; a command can't
+      // tell which surface ran it, so the toast names neither.
+      $.ui.toast(isShown ? 'CLAUDE.md line shown' : 'CLAUDE.md line hidden')
       return {}
     }
-    await openPane($)
+    await togglePane($)
 
     return {}
   })
@@ -447,59 +521,47 @@ export const register: Register = on => {
     return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${COMPACT_NOTE}` : COMPACT_NOTE })
   })
 
-  // The status line: a row of its own under the hint line below the prompt, which only the terminal
-  // draws. ($.ui.status would pin it above, among the engine's notices, under a warning sign.)
-  // It hides and shows with the band, so hiding the band hides every sign of the plugin.
+  // The status line: in the terminal the band's line moves here, to a row of its own under the hint
+  // line below the prompt, which only the terminal draws, so there's no band above the prompt.
+  // ($.ui.status would pin it above, among the engine's notices, under a warning sign.) The band
+  // choice shows and hides it. The row has no width to measure, so the summary is cut to fit.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const hint = await next(e)
     if (e.surface !== 'terminal' || !(await read($, bandAtom))) return hint
     const { Box, Text } = $.ui.resolve(e)
-    const pin = await read($, pinAtom)
-    const count = countOf(pin)
+    const line = lineOf(await read($, pinAtom), await read($, turnAtom))
 
     return (
       <Box flexDirection="column">
         {hint}
-        <Box key="status" flexDirection="row" columnGap={1}>
-          <Box flexShrink={0}>{count === 0 ? <Text dimColor>○</Text> : <Text color="success">●</Text>}</Box>
-          <Box flexShrink={1} minWidth={0}>
-            <Text dimColor wrap="truncate-end">
-              {statusOf(pin)}
-            </Text>
-          </Box>
+        <Box key="status" flexDirection="row" columnGap={2}>
+          {pinnedLine({ Box, Text }, line, { folders: 2, hasSummary: true })}
         </Box>
       </Box>
     )
   })
 
-  // The band above the prompt: one quiet line, shown until hidden, beneath any other plugin's band.
+  // The band above the prompt, on the desktop: one quiet line, shown until hidden, beneath any other
+  // plugin's band. The terminal draws the same line under the prompt instead (see PromptHint).
   // Colors are theme keys or dim alone, never raw, so it reads in light and dark themes.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || !(await read($, bandAtom))) return next(e)
+    if (e.surface === 'terminal' || e.props.hasSurvey || !(await read($, bandAtom))) return next(e)
 
     // The slot holds one tree, so draw the other plugins' bands too rather than replacing them,
     // then a blank row and a rule, and this one last, at the bottom, next to the prompt.
     const others = await next(e)
     const hasOthers = !isBlank(others)
     const { Box, Button, Text } = $.ui.resolve(e)
-    const pin = await read($, pinAtom)
-    const turn = await read($, turnAtom)
-    const count = countOf(pin)
-    // Each subfolder file with its own count, the one closest to unpinning first; the band names
-    // the first two, or one when the band is narrow, and counts the rest, which the pane lists.
-    const nested = pin.files
-      .flatMap(f => (f.scope === undefined ? [] : [{ folder: folderName(f.scope), left: messagesLeft(f, turn) }]))
-      .sort((a, b) => a.left - b.left)
-    const summary = `${count} ${count === 1 ? 'file' : 'files'}, ~${formatTokens(tokensOf(render(pin) ?? ''))} tokens`
-    // What fits the band's width: fewer folders first, then no summary. The desktop draws its
-    // buttons as keys in boxes, a few cells wider than the terminal's.
+    const line = lineOf(await read($, pinAtom), await read($, turnAtom))
+    // The band names the first two subfolder files, or one when it's narrow, and counts the rest,
+    // which the pane lists. What fits its width: fewer folders first, then no summary. The desktop
+    // draws its buttons as keys in boxes.
     const fit = bandLayout(e.props.bodyColumns, {
-      status: count === 0 ? '○ No CLAUDE.md found' : '● CLAUDE.md pinned',
-      summary,
-      folders: nested.map(({ folder, left }) => `${folder} unpins in ${left}`),
-      buttons: e.surface === 'terminal' ? 19 : 25,
+      status: line.count === 0 ? '○ No CLAUDE.md found' : '● CLAUDE.md pinned',
+      summary: line.summary,
+      folders: line.nested.map(({ folder, left }) => `${folder} unpins in ${left}`),
+      buttons: 25,
     })
-    const named = nested.slice(0, fit.folders)
 
     return (
       <Box flexDirection="column">
@@ -512,39 +574,7 @@ export const register: Register = on => {
           </Box>
         )}
         <Box flexDirection="row" columnGap={2}>
-          <Box flexDirection="row" columnGap={1} flexGrow={1} flexShrink={1} minWidth={0}>
-            <Box flexShrink={0}>
-              {count === 0 ? <Text dimColor>○</Text> : <Text color="success">●</Text>}
-            </Box>
-            <Box flexShrink={0}>
-              <Text dimColor={count === 0}>{count === 0 ? 'No CLAUDE.md found' : 'CLAUDE.md pinned'}</Text>
-            </Box>
-            {count > 0 && fit.hasSummary && (
-              <Box flexShrink={1} minWidth={0}>
-                <Text dimColor wrap="truncate-end">
-                  {summary}
-                </Text>
-              </Box>
-            )}
-          </Box>
-          {named.length > 0 && (
-            <Box flexDirection="row" columnGap={2} flexShrink={0}>
-              {named.map(({ folder, left }) => (
-                <Box key={folder} flexShrink={0}>
-                  {left <= NEAR_UNPIN ? (
-                    <Text color="warning">{`${folder} unpins in ${left}`}</Text>
-                  ) : (
-                    <Text dimColor>{`${folder} unpins in ${left}`}</Text>
-                  )}
-                </Box>
-              ))}
-              {nested.length > named.length && (
-                <Box key="more" flexShrink={0}>
-                  <Text dimColor>{`+${nested.length - named.length} more`}</Text>
-                </Box>
-              )}
-            </Box>
-          )}
+          {pinnedLine({ Box, Text }, line, fit)}
           <Box flexDirection="row" columnGap={2} flexShrink={0}>
             <Button key="details" label="Details" hotkey="o" plain dimColor onPress={() => void openPane($)} />
             <Button key="hide" label="Hide" hotkey="x" plain dimColor onPress={() => setBand($, false)} />
@@ -582,10 +612,12 @@ export const register: Register = on => {
       })().catch(() => undefined)
 
     // The toolbar and its rule: drawn above the scrolled body, so they never move.
+    // In the terminal the band's line is the status line under the prompt, so the button names that.
+    const lineName = isFixed ? 'status line' : 'band'
     const bandButton = isBandShown ? (
-      <Button key="band" label="Hide band" hotkey="h" plain dimColor onPress={() => setBand($, false)} />
+      <Button key="band" label={`Hide ${lineName}`} hotkey="h" plain dimColor onPress={() => setBand($, false)} />
     ) : (
-      <Button key="band" label="Show band" hotkey="s" plain dimColor onPress={() => setBand($, true)} />
+      <Button key="band" label={`Show ${lineName}`} hotkey="s" plain dimColor onPress={() => setBand($, true)} />
     )
     // The fixed top: the toolbar, then `sub` a row below it when there is one, then a rule; the
     // body scrolls under it.
@@ -656,15 +688,12 @@ export const register: Register = on => {
     const opened = viewing === null ? undefined : pin.files.find(f => keyOf(f.path) === viewing)
     const shown =
       viewing === RAW && pin.source === 'raw'
-        ? { name: 'CLAUDE.md', detail: 'As another plugin rewrote it', content: pin.raw ?? '' }
+        ? { name: 'CLAUDE.md', detail: RAW_DETAIL, content: pin.raw ?? '' }
         : opened === undefined
           ? undefined
           : {
               name: displayPath(opened.path, places),
-              detail:
-                opened.scope === undefined
-                  ? (TIERS[opened.kind] ?? opened.kind)
-                  : `Applies while Claude works in ${folderName(opened.scope)}`,
+              detail: detailOf(opened),
               content: opened.content,
             }
     if (shown !== undefined) {
