@@ -1,0 +1,11 @@
+{
+  "name": "always-read-claudemd",
+  "owner": { "name": "Jake Campbell" },
+  "plugins": [
+    {
+      "name": "always-read-claudemd",
+      "source": "./plugins/always-read-claudemd",
+      "description": "Pins your CLAUDE.md into the system prompt so its rules survive compaction and are re-synced before every model request."
+    }
+  ]
+}
