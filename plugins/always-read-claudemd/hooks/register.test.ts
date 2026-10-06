@@ -9,7 +9,7 @@ import type {
   UiPane,
 } from 'claude-code'
 
-import { bandLayout, scrollBar, scrolled, tabTitle } from './pin'
+import { bandLayout, isBlank, scrollBar, scrolled, tabTitle } from './pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'
@@ -582,6 +582,14 @@ test("on the desktop the open file's name and size stay in the pane's tab title"
   await pane.unmount()
 
   expect(tabTitle('~/.claude/CLAUDE.md', 1200)).toBe('.claude/CLAUDE.md, ~1.2k tokens')
+})
+
+test('no rule is drawn for a band slot that draws nothing', () => {
+  // What the engine hands a band hook when no other plugin draws a band.
+  expect(isBlank({ type: 'engine', ref: 1 })).toBe(true)
+  expect(isBlank({ type: 'Box', props: {}, children: [{ type: 'engine', ref: 1 }, false] })).toBe(true)
+  expect(isBlank({ type: 'Box', props: {}, children: [] })).toBe(true)
+  expect(isBlank({ type: 'Box', props: {}, children: [{ type: 'Text', props: {}, children: ['Usage'] }] })).toBe(false)
 })
 
 test("the band keeps another plugin's band above it", async ($, on) => {

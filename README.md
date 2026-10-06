@@ -51,7 +51,7 @@ Each subfolder file has its own count of messages left before it's unpinned. The
 
 These keys work while the band is focused, with a click or `ctrl+x tab`. They differ from the keys in usage-mod's band menu, so the two bands never fight over a key.
 
-If other plugins also draw bands above the prompt, they're all shown. This one comes last, next to the prompt, with a blank row and a line separating it from theirs.
+If other plugins also draw bands above the prompt, they're all shown. This one comes last, next to the prompt, with a blank row and a line separating it from theirs. With no other band, there's no line.
 
 **The pane** opens with `/claudemd`:
 

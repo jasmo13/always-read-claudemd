@@ -14,6 +14,7 @@ import {
   folderName,
   formatTokens,
   isAbsolute,
+  isBlank,
   isInside,
   keyOf,
   messagesLeft,
@@ -479,7 +480,7 @@ export const register: Register = on => {
     // The slot holds one tree, so draw the other plugins' bands too rather than replacing them,
     // then a blank row and a rule, and this one last, at the bottom, next to the prompt.
     const others = await next(e)
-    const hasOthers = !(others.type === 'Box' && (others.children ?? []).length === 0)
+    const hasOthers = !isBlank(others)
     const { Box, Button, Text } = $.ui.resolve(e)
     const pin = await read($, pinAtom)
     const turn = await read($, turnAtom)
