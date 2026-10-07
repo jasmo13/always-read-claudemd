@@ -45,6 +45,8 @@ const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as c
 const running = new Set<string>()
 // Whether the CLAUDE.md message is being rewritten, so a second change waits for the first.
 let isSwapping = false
+// How many prompts the chat held when last drawn, so a rewind, which takes some away, is noticed.
+let promptsSeen = 0
 /**
  * Whether someone is watching the chat: the terminal, or an app showing it (the desktop app attaches
  * when it opens a chat). A run with neither (-p, a bare SDK app) prints the last result it has, and a
@@ -105,6 +107,27 @@ async function lastWritten($: EngineInterface, transcript: string): Promise<stri
     if (row.type === 'user' && isMessage(text)) return text
   }
   return null
+}
+
+/**
+ * A rewind restores the chat as it was, CLAUDE.md message included, and that message can be older
+ * than the files: the chat holds fewer prompts than before, and the message is brought in step with
+ * disk before the next one.
+ */
+async function noticeRewind($: EngineInterface) {
+  const prompts = await $.session.turns()
+  const isBack = prompts < promptsSeen
+  promptsSeen = prompts
+  if (isBack && running.size === 0) await refresh($)
+}
+
+/**
+ * Checks the files: between turns, in a chat someone is watching, the CLAUDE.md message is
+ * rewritten at once if they changed; otherwise they're re-read, and it's rewritten when the turn ends.
+ */
+async function check($: EngineInterface) {
+  if (running.size === 0 && (await isWatched($))) await refresh($)
+  else await sync($)
 }
 
 /** The CLAUDE.md message a chat opened in this process last had: its transcript's when resumed. */
@@ -482,6 +505,9 @@ export const register: Register = on => {
     await recall($).catch(() => undefined)
     // A new chat gets its CLAUDE.md message first; a resumed one has it rewritten if the files changed.
     await refresh($).catch(() => undefined)
+    // Only files that exist are watched: once a second the files are checked too, so a CLAUDE.md
+    // created where there was none is pinned within a second.
+    $.clock.every(1000, () => void check($).catch(() => undefined))
 
     return started
   })
@@ -507,12 +533,13 @@ export const register: Register = on => {
     return watched.length === 0 ? result : { ...result, watchPaths: [...(result.watchPaths ?? []), ...watched] }
   })
 
-  // Known by name, so a hot reload (which keeps the watch but forgets the module's variables) still
-  // hears it. Every other watched path is an instruction file, or the file one links to: between
-  // turns the CLAUDE.md message is rewritten at once, during one when the turn ends.
+  // Claude Code tells every plugin of every watched file's change, other plugins' store files too:
+  // those are theirs. This plugin's own store file is known by name, so a hot reload (which keeps
+  // the watch but forgets the module's variables) still hears it. Every other path is an instruction
+  // file, or the file one links to.
   on('classic.FileChanged', ($, e, next) => {
     if (isStoreFile(e.file_path)) void followBand($).catch(() => undefined)
-    else void isWatched($).then(isOn => (running.size === 0 && isOn ? refresh($) : sync($))).catch(() => undefined)
+    else if (!keyOf(e.file_path).includes('/plugins/store/')) void check($).catch(() => undefined)
     return next(e)
   })
 
@@ -677,6 +704,8 @@ export const register: Register = on => {
   // plugin's band. The terminal draws the same line under the prompt instead (see PromptHint).
   // Colors are theme keys or dim alone, never raw, so it reads in light and dark themes.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Claude Code redraws this slot after a rewind, on every surface.
+    void noticeRewind($).catch(() => undefined)
     if (e.surface === 'terminal' || e.props.hasSurvey || !(await read($, bandAtom))) return next(e)
 
     // The slot holds one tree, so draw the other plugins' bands too rather than replacing them,
