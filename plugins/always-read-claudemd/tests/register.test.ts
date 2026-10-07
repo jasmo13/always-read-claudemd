@@ -9,7 +9,7 @@ import type {
   UiPane,
 } from 'claude-code'
 
-import { bandLayout, displayPath, isBlank, scrollBar, scrolled, tabTitle } from './pin'
+import { bandLayout, displayPath, isBlank, scrollBar, scrolled, tabTitle } from '../hooks/pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'

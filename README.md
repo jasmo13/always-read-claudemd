@@ -132,7 +132,7 @@ The plugin lives in `plugins/always-read-claudemd/`; the repository root holds t
 | --- | --- |
 | `hooks/register.tsx` | Hooks: capturing the CLAUDE.md block, pinning it in the system prompt, re-syncing from disk, subfolder pins, the compaction note, the band and the pane |
 | `hooks/pin.ts` | Pure helpers: the pinned text, paths, token estimates |
-| `hooks/register.test.ts` | Tests |
+| `tests/register.test.ts` | Tests |
 | `types/index.d.ts` | Types for the values the plugin keeps between reloads |
 | `.claude-plugin/plugin.json` | The plugin's manifest and version |
 
