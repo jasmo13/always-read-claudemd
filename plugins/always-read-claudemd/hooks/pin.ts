@@ -1,4 +1,4 @@
-import type { Pin, PinnedFile } from '../types'
+import type { Pin, PinnedFile, Seen } from '../types'
 
 export const SECTION_ID = 'always-read-claudemd:claudemd'
 // The most often the files are re-checked; each check is a few stats.
@@ -27,11 +27,21 @@ export const TIERS: Record<string, string> = {
   memory: 'Auto memory',
 }
 
+const OVERRIDE = 'IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.'
+
 const HEADER = [
   '# CLAUDE.md (pinned)',
   '',
   "These are the user's CLAUDE.md instructions. They are pinned in the system prompt, so they stay in force for the whole session, including after the conversation is compacted or summarized, and they are re-synced from disk whenever the files change.",
-  'IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.',
+  'When the files change during the session, the change arrives as a "CLAUDE.md (pinned): updated" note, which replaces the matching parts of this copy.',
+  OVERRIDE,
+].join('\n')
+
+const UPDATE_HEADER = [
+  '# CLAUDE.md (pinned): updated',
+  '',
+  "The user's CLAUDE.md instructions changed during this session. This note replaces the matching parts of the pinned CLAUDE.md in the system prompt; the rest of it is unchanged and still in force.",
+  OVERRIDE,
 ].join('\n')
 
 export const keyOf = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -61,16 +71,57 @@ function section(file: PinnedFile): string {
   return `Contents of ${file.path} (${label}):\n\n${file.content.trim()}`
 }
 
-/** The pinned text the model reads, or null when there is nothing to pin. */
-export function render(pin: Pin): string | null {
+/** One part of the pin as the model reads it: a file's section, or the text another plugin rewrote. */
+type Part = { key: string; path: string; text: string }
+
+const RAW_PATH = 'CLAUDE.md, as another plugin rewrote it'
+
+function partsOf(pin: Pin): Part[] {
   const nested = pin.files.filter(f => f.scope !== undefined)
   const shown = pin.source === 'raw' ? nested : pin.files
-  const parts = [
-    ...(pin.source === 'raw' && (pin.raw ?? '').trim() !== '' ? [(pin.raw ?? '').trim()] : []),
-    ...shown.filter(f => f.content.trim() !== '').map(section),
+  const raw = (pin.raw ?? '').trim()
+  return [
+    ...(pin.source === 'raw' && raw !== '' ? [{ key: 'raw', path: RAW_PATH, text: raw }] : []),
+    ...shown.filter(f => f.content.trim() !== '').map(f => ({ key: keyOf(f.path), path: f.path, text: section(f) })),
   ]
+}
 
-  return parts.length === 0 ? null : `${HEADER}\n\n${parts.join('\n\n')}`
+/** The pinned text the model reads, or null when there is nothing to pin. */
+export function render(pin: Pin): string | null {
+  const parts = partsOf(pin)
+  return parts.length === 0 ? null : `${HEADER}\n\n${parts.map(p => p.text).join('\n\n')}`
+}
+
+/** A short fingerprint of a text (FNV-1a), so what Claude holds is kept without the text itself. */
+function hashOf(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193)
+  return `${(hash >>> 0).toString(16)}:${text.length}`
+}
+
+/** What Claude holds of a pin: each part's path and fingerprint, by key. */
+export function seenOf(pin: Pin): Seen {
+  return Object.fromEntries(partsOf(pin).map(p => [p.key, { path: p.path, hash: hashOf(p.text) }]))
+}
+
+/**
+ * The note that brings Claude from what it holds (`seen`) to the pin: each new or changed part in
+ * full, and the paths no longer in force. Null when Claude already holds the pin.
+ */
+export function updateOf(seen: Seen, pin: Pin): string | null {
+  const parts = partsOf(pin)
+  const changed = parts.filter(p => seen[p.key]?.hash !== hashOf(p.text))
+  const keys = new Set(parts.map(p => p.key))
+  const gone = Object.entries(seen).flatMap(([key, { path }]) => (keys.has(key) ? [] : [path]))
+  if (changed.length === 0 && gone.length === 0) return null
+
+  return [
+    UPDATE_HEADER,
+    ...changed.map(p => p.text),
+    ...(gone.length === 0
+      ? []
+      : [`No longer in force (deleted, emptied or unpinned); stop following these files' instructions: ${gone.join(', ')}`]),
+  ].join('\n\n')
 }
 
 /** How many files the pin carries, as the band and status line count them. */
