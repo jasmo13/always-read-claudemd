@@ -1,16 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type {
-  InstructionFile,
-  On,
-  RenderElement,
-  PromptComposeSection,
-  PromptContextInput,
-  SessionMessage,
-  UiPane,
-} from 'claude-code'
+import type { InstructionFile, On, RenderElement, PromptContextInput, RenderSurface, SessionMessage, UiPane } from 'claude-code'
 
-import { bandLayout, displayPath, isBlank, scrollBar, scrolled, tabTitle } from '../hooks/pin'
+import { HEADER, bandLayout, displayPath, filesOf, isBlank, isMessage, render, scrollBar, scrolled, tabTitle } from '../hooks/pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'
@@ -21,7 +13,6 @@ const API_MD = `${PROJECT}/api/CLAUDE.md`
 const API_FILE = `${PROJECT}/api/orders.ts`
 // The plugin's file in Claude Code's store, which every chat watches.
 const STORE_FILE = `${HOME}/.claude/plugins/store/always-read-claudemd_inline-abc123.json`
-const SECTION_ID = 'always-read-claudemd:claudemd'
 
 const COMPOSE = {
   model: 'claude-opus-5-5',
@@ -32,6 +23,8 @@ const COMPOSE = {
   traits: [],
 } as const
 const MESSAGE: SessionMessage = { role: 'user', text: 'hello', toolUses: [] }
+const REPLY: SessionMessage = { role: 'assistant', text: 'Hi.', toolUses: [] }
+const SUBMIT = { text: 'next', wait: false, origin: { kind: 'composer' } } as const
 
 // The engine hands paths to fs hooks in the platform's own spelling.
 const keyOf = (path: string) => path.replace(/\\/g, '/').toLowerCase()
@@ -149,6 +142,71 @@ function engine(on: On, files: InstructionFile[] | null, options: { rewrittenAs?
   }
 }
 
+const isOwn = (m: SessionMessage) => m.role === 'user' && isMessage(m.text)
+
+/**
+ * The chat beneath the plugin: its messages, as `$.session.messages()` reads them, and Claude
+ * Code's /compact, which runs `session.compact` over them and keeps what it answers. Beneath the
+ * plugin's hook the summarizer answers with a summary and the last message. Turns, attachments
+ * and the classic hooks pass through.
+ */
+function conversation($: Engine, on: On, messages: SessionMessage[] = [MESSAGE, REPLY]) {
+  const chat = { messages, swaps: 0, summaries: 0, surfaces: ['terminal'] as RenderSurface[] }
+  on('session.messages', () => ({ value: [...chat.messages] }) as never)
+  on('session.surfaces', () => ({ value: [...chat.surfaces] }) as never)
+  on('command.run', { command: 'compact' }, async (_$, e) => {
+    const done = await $.session.compact({ trigger: 'manual', messages: chat.messages, instructions: e.args })
+    if (done.messages !== undefined) chat.messages = [...done.messages]
+    chat.swaps += 1
+    return {}
+  })
+  on('session.compact', (_$, e) => {
+    chat.summaries += 1
+    return { messages: [{ role: 'user', text: `Summary of the chat (${e.instructions ?? ''}).`, toolUses: [] }, ...e.messages.slice(-1)] }
+  })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.attach', (_$, e) => ({ clientId: e.clientId }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('prompt.attachment', (_$, e) => ({ text: e.text }))
+  on('classic.SessionStart', () => ({}))
+  on('classic.FileChanged', () => ({}))
+  on('ui.invalidate', () => ({ value: undefined }) as never)
+
+  let turns = 0
+  return {
+    chat,
+    /** The CLAUDE.md message's text when it is first in the chat. */
+    first: () => {
+      const [head] = chat.messages
+      return head !== undefined && isOwn(head) ? head.text : undefined
+    },
+    /** A chat opens: in the terminal, or with nothing drawing it (the desktop app before it attaches, -p). */
+    start: (isInteractive = true) => {
+      chat.surfaces = isInteractive ? ['terminal'] : []
+      return $.session.start({ cwd: PROJECT, surface: isInteractive ? 'terminal' : null, isInteractive })
+    },
+    /** The desktop app opens the chat. */
+    attach: () => {
+      chat.surfaces = ['desktop']
+      return $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+    },
+    /** A turn of the main chat: its work, then its end. */
+    turn: async (work: () => Promise<unknown> = async () => undefined) => {
+      const turnId = `turn-${(turns += 1)}`
+      await $.turn.start({ text: 'go', turnId })
+      await work()
+      return $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId, reason: 'answer' } as never)
+    },
+    sessionStart: (source: 'startup' | 'resume' | 'clear' | 'compact' | 'fork', transcript = '') =>
+      $.classic.SessionStart({ session_id: 's1', transcript_path: transcript, cwd: PROJECT, hook_event_name: 'SessionStart', source } as never),
+    changed: (path: string) =>
+      $.classic.FileChanged({ session_id: 's1', transcript_path: '', cwd: PROJECT, hook_event_name: 'FileChanged', file_path: path, event: 'change' } as never),
+    attachment: (type: string, text: string, agentId?: string) =>
+      $.prompt.attachment({ type, text, origin: { kind: 'engine' }, ...(agentId === undefined ? {} : { agentId }) } as never),
+  }
+}
+
 const BAND = {
   component: 'AbovePrompt',
   props: {
@@ -175,145 +233,370 @@ function tools(on: On) {
   on('prompt.submit', (_$, e) => ({ text: e.text, ...(e.context === undefined ? {} : { context: e.context }) }))
 }
 
-const pinned = (sections: readonly PromptComposeSection[]) => sections.find(s => s.id === SECTION_ID)
-
-test('moves CLAUDE.md out of the first message and into the system prompt', async ($, on) => {
+test('a new chat gets CLAUDE.md as its first message; the system prompt and context are left alone', async ($, on) => {
   world(on, { [PROJECT_MD]: 'Always use tabs.' }, 1_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Always use tabs.' }])
+  const { chat, first, start } = conversation($, on)
 
   const context = await $.prompt.context(input)
-  expect(context.blocks.map(b => b.name)).toEqual(['currentDate'])
+  expect(context.blocks.map(b => b.name)).toEqual(['claudeMd', 'currentDate'])
+  await start()
 
-  const { sections } = await $.prompt.compose(COMPOSE)
-  const section = pinned(sections)
-  expect(sections[sections.length - 1]?.id).toBe(SECTION_ID)
-  expect(section?.scope).toBe('session')
-  expect(section?.text).toContain('Always use tabs.')
-  expect(section?.text).toContain('project instructions')
+  // A system reminder, in the tags Claude Code wraps its own in.
+  const text = first() ?? ''
+  expect(text.startsWith(`<system-reminder>\n${HEADER}\n\n`)).toBe(true)
+  expect(text.endsWith('\n</system-reminder>')).toBe(true)
+  expect(text).toContain(`Contents of ${PROJECT_MD} (project instructions, checked into the codebase):\n\nAlways use tabs.`)
+  // Put first by a compaction the plugin answers itself: nothing is summarized, the chat is kept.
+  expect(chat.swaps).toBe(1)
+  expect(chat.summaries).toBe(0)
+  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
+  // The system prompt is Claude Code's own.
+  expect((await $.prompt.compose(COMPOSE)).sections.map(s => s.id)).toEqual(['intro'])
 })
 
-test('pins what is on disk when the system prompt renders before the context', async ($, on) => {
+test('pins what is on disk when Claude Code has not said which files it read', async ($, on) => {
   world(on, { [PROJECT_MD]: 'Never commit to main.', [USER_MD]: 'Answer briefly.' }, 2_000_000)
   engine(on, null)
+  const { first, start } = conversation($, on)
 
-  const { sections } = await $.prompt.compose(COMPOSE)
-  expect(pinned(sections)?.text).toContain('Never commit to main.')
-  expect(pinned(sections)?.text).toContain('Answer briefly.')
+  await start()
+  expect(first()).toContain('Never commit to main.')
+  expect(first()).toContain('Answer briefly.')
 })
 
-test('with no CLAUDE.md anywhere it adds nothing and leaves the context alone', async ($, on) => {
+test('with no CLAUDE.md anywhere it adds no message', async ($, on) => {
   world(on, {}, 3_000_000)
-  const input = engine(on, null)
+  engine(on, null)
+  const { chat, first, start } = conversation($, on)
 
-  const context = await $.prompt.context(input)
-  expect(context.blocks.map(b => b.name)).toEqual(['currentDate'])
-  const { sections } = await $.prompt.compose(COMPOSE)
-  expect(sections.map(s => s.id)).toEqual(['intro'])
+  await start()
+  expect(first()).toBeUndefined()
+  expect(chat.swaps).toBe(0)
   const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...HINT })
   expect(await hint.find({ text: 'No CLAUDE.md found' })).toBeDefined()
   await hint.unmount()
 })
 
-test('re-syncs edits, new files and deletions made outside Claude Code', async ($, on) => {
-  const { clock, toasts, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_000_000)
-  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
-  await $.prompt.compose(COMPOSE)
+test('between turns an edit rewrites the message at once; during a turn, when the turn ends', async ($, on) => {
+  const { clock, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, turn, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
 
   write(PROJECT_MD, 'Use two spaces.')
-  await clock.advance(1500)
-  let text = pinned((await $.prompt.compose(COMPOSE)).sections)?.text
-  expect(text).toContain('Use two spaces.')
-  expect(text).not.toContain('Use tabs.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(chat.swaps).toBe(2)
+  expect(first()).toContain('Use two spaces.')
+  expect(first()).not.toContain('Use tabs.')
   expect(toasts).toContain('CLAUDE.md changed: re-pinned')
 
+  await turn(async () => {
+    write(PROJECT_MD, 'Use four spaces.')
+    await changed(PROJECT_MD)
+    await clock.advance(10)
+    // Never mid-turn: the turn's requests keep the message they started with.
+    expect(chat.swaps).toBe(2)
+  })
+  expect(chat.swaps).toBe(3)
+  expect(first()).toContain('Use four spaces.')
+  // One CLAUDE.md message, the rest of the chat as it was, and nothing summarized.
+  expect(chat.messages.filter(isOwn).length).toBe(1)
+  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
+  expect(chat.summaries).toBe(0)
+
+  // A turn with nothing changed leaves the chat alone.
+  await turn()
+  expect(chat.swaps).toBe(3)
+
+  // Claude Code re-reads its context after a compaction, and its copy can be older than the disk
+  // (the engine here still gives 'Use tabs.'): the message keeps what is on disk.
+  await $.prompt.context(input)
+  await turn()
+  expect(chat.swaps).toBe(3)
+  expect(first()).toContain('Use four spaces.')
+})
+
+test('a new file and a deleted file rewrite the message too', async ($, on) => {
+  const { write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, turn } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+
   write(LOCAL_MD, 'My local rule.')
-  await clock.advance(1500)
-  text = pinned((await $.prompt.compose(COMPOSE)).sections)?.text
-  expect(text).toContain('Use two spaces.')
-  expect(text).toContain('My local rule.')
+  await turn()
+  expect(first()).toContain('Use tabs.')
+  expect(first()).toContain("My local rule.")
 
   remove(PROJECT_MD)
   remove(LOCAL_MD)
-  await clock.advance(1500)
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)).toBeUndefined()
+  await turn()
+  expect(first()).toBeUndefined()
+  expect(chat.messages.some(isOwn)).toBe(false)
 })
 
-test('checks the disk at most once a second', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 5_000_000)
-  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Rule A.' }]))
-  await $.prompt.compose(COMPOSE)
-
-  write(PROJECT_MD, 'Rule B.')
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Rule A.')
-  await clock.advance(1000)
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Rule B.')
-})
-
-test('pins text another plugin rewrote, until the files on disk change', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 6_000_000)
-  await $.prompt.context(
-    engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Rule A.' }], { rewrittenAs: 'Rewritten rule A.' }),
-  )
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Rewritten rule A.')
-
-  write(PROJECT_MD, 'Rule B.')
-  await clock.advance(1500)
-  const text = pinned((await $.prompt.compose(COMPOSE)).sections)?.text
-  expect(text).toContain('Rule B.')
-  expect(text).not.toContain('Rewritten rule A.')
-})
-
-test('tells the summarizer the rules stay in force, after the typed instructions', async ($, on) => {
-  world(on, { [PROJECT_MD]: 'Use tabs.' }, 7_000_000)
+test("Claude Code's own copies are left out once the chat has the message; a subagent keeps them", async ($, on) => {
+  world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 5_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  let instructions: string | undefined
-  on('session.compact', (_$, e) => {
-    instructions = e.instructions
-    return { messages: [{ ...MESSAGE, text: 'summary' }] }
-  })
-
-  await $.prompt.context(input)
-  await $.session.compact({ trigger: 'manual', messages: [MESSAGE], instructions: 'keep the plan' })
-  expect(instructions?.startsWith('keep the plan')).toBe(true)
-  expect(instructions).toContain('pinned in the system prompt')
-})
-
-test('pins a subfolder CLAUDE.md once Claude opens a file there, and keeps it through a re-read', async ($, on) => {
-  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 8_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { start, turn, attachment } = conversation($, on)
   tools(on)
   await $.prompt.context(input)
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).not.toContain('Validate every endpoint.')
+  const ENGINE_COPY = `Contents of ${PROJECT_MD} (project instructions, checked into the codebase):\n\nUse tabs.`
+  const NESTED_COPY = `Contents of ${API_MD}:\n\nValidate every endpoint.`
 
-  await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
-  let text = pinned((await $.prompt.compose(COMPOSE)).sections)?.text
-  expect(text).toContain('Validate every endpoint.')
-  expect(text).toContain('apply when working in')
+  // Before the message is in the chat, Claude Code's copy is all Claude has.
+  expect((await attachment('instructions', ENGINE_COPY)).text).toBe(ENGINE_COPY)
+  await start()
+  expect((await attachment('instructions', ENGINE_COPY)).text).toBeNull()
+  expect((await attachment('instructions', ENGINE_COPY, 'agent-1')).text).toBe(ENGINE_COPY)
+  // A subfolder's copy stays until the message holds that file.
+  expect((await attachment('nested_memory', NESTED_COPY)).text).toBe(NESTED_COPY)
+  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
+  expect((await attachment('nested_memory', NESTED_COPY)).text).toBeNull()
+  // Other attachments pass through.
+  expect((await attachment('todo_reminder', 'Keep the list current.')).text).toBe('Keep the list current.')
+})
+
+test('a subfolder CLAUDE.md is pinned once Claude opens a file there, into the message when the turn ends', async ($, on) => {
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 8_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, turn } = conversation($, on)
+  tools(on)
+  await $.prompt.context(input)
+  await start()
+  expect(first()).not.toContain('Validate every endpoint.')
+
+  await turn(async () => {
+    await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
+    expect(first()).not.toContain('Validate every endpoint.')
+  })
+  // The fake disk names folders in lower case.
+  expect(first()).toContain(`Contents of ${API_MD} (subfolder instructions; apply when working in ${keyOf(PROJECT)}/api):\n\nValidate every endpoint.`)
   expect(toasts.some(t => t.startsWith('CLAUDE.md pinned:'))).toBe(true)
 
-  // Compaction or /clear re-reads the engine's block, which never holds subfolder files.
+  // Claude Code reading its files again (a compaction, /clear) never holds subfolder files: kept.
   await $.prompt.context(input)
-  text = pinned((await $.prompt.compose(COMPOSE)).sections)?.text
-  expect(text).toContain('Use tabs.')
-  expect(text).toContain('Validate every endpoint.')
+  await turn()
+  expect(chat.swaps).toBe(2)
+  expect(first()).toContain('Validate every endpoint.')
+})
+
+test('/compact summarizes as usual, then the CLAUDE.md message goes back first, whole', async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 7_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+
+  write(PROJECT_MD, 'Use spaces.')
+  await clock.advance(1500)
+  for (const trigger of ['manual', 'auto'] as const) {
+    const done = await $.session.compact({ trigger, messages: chat.messages, instructions: 'keep the plan' })
+    const messages = done.messages ?? []
+    // The summarizer is told what the person typed, and nothing else.
+    expect(messages[1]?.text).toBe('Summary of the chat (keep the plan).')
+    expect(isMessage(messages[0]?.text ?? '')).toBe(true)
+    expect(messages[0]?.text).toContain('Use spaces.')
+    expect(messages.filter(isOwn).length).toBe(1)
+    chat.messages = [...messages]
+  }
+})
+
+test('/clear empties the chat, and the CLAUDE.md message is put back', async ($, on) => {
+  const { clock } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 7_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, sessionStart } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+
+  chat.messages = []
+  await sessionStart('clear')
+  await clock.advance(10)
+  expect(first()).toContain('Use tabs.')
+  expect(chat.messages.length).toBe(1)
+})
+
+test('a resumed chat is left alone when nothing changed, and its message rewritten when something did', async ($, on) => {
+  const held = render({
+    files: [
+      { path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 },
+      { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` },
+    ],
+    raw: null,
+    source: 'engine',
+  })
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_000_000)
+  engine(on, null)
+  // Reopened in a new process: what is pinned, subfolder files included, is read back from the message.
+  const { chat, first, start } = conversation($, on, [{ role: 'user', text: held ?? '', toolUses: [] }, MESSAGE, REPLY])
+  await start()
+  expect(chat.swaps).toBe(0)
+
+  write(API_MD, 'Validate every endpoint twice.')
+  await start()
+  expect(chat.swaps).toBe(1)
+  expect(first()).toContain('Validate every endpoint twice.')
+  expect(first()).toContain('Use tabs.')
+  expect(chat.messages.filter(isOwn).length).toBe(1)
+})
+
+test("a resumed chat keeps the subfolder files its transcript's last message held", async ($, on) => {
+  const project = { path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 } as const
+  const older = render({ files: [project], raw: null, source: 'engine' }) ?? ''
+  const last = render({
+    files: [project, { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` }],
+    raw: null,
+    source: 'engine',
+  })
+  const TRANSCRIPT = `${HOME}/.claude/projects/app/s1.jsonl`
+  const row = (text: string) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_100_000)
+  write(TRANSCRIPT, [row(older), row('hello'), row(last ?? ''), ''].join('\n'))
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  // Claude Code reloads the chat through the history a rewrite replaced: the older message.
+  const { chat, first, start, sessionStart } = conversation($, on, [{ role: 'user', text: older, toolUses: [] }, MESSAGE, REPLY])
+  // In the order the terminal raises them: SessionStart, its own files read, then the chat starts.
+  await sessionStart('resume', TRANSCRIPT)
+  await $.prompt.context(input)
+  await start()
+  expect(chat.swaps).toBe(1)
+  expect(first()).toContain('Validate every endpoint.')
+
+  const done = await $.session.compact({ trigger: 'manual', messages: chat.messages })
+  chat.messages = [...(done.messages ?? [])]
+  expect(first()).toContain('Use tabs.')
+  expect(first()).toContain('Validate every endpoint.')
+})
+
+test('the chat does not draw the CLAUDE.md message; it draws every other message as usual', async ($, on) => {
+  // Claude Code beneath draws a user message as its text.
+  on('ui.render', { component: 'UserMessage' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, {}, e.props.text) as RenderElement
+  })
+  const own = render({ files: [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 }], raw: null, source: 'engine' }) ?? ''
+  const row = (text: string) =>
+    $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', component: 'UserMessage', props: { text, origin: { kind: 'unclassified' }, isExpanded: false } } as never)
+
+  const message = await row(own)
+  expect(await message.find({ text: 'Use tabs.' })).toBeUndefined()
+  await message.unmount()
+  const prompt = await row('hello')
+  expect(await prompt.find({ text: 'hello' })).toBeDefined()
+  await prompt.unmount()
+})
+
+test('with nothing drawing the chat (-p, the SDK) the message is rewritten as a run starts, never after its answer', async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 9_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, turn, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start(false)
+  expect(chat.swaps).toBe(1)
+
+  // The run prints the last result it has, so a rewrite after the answer would replace it.
+  await turn(async () => write(PROJECT_MD, 'Use spaces.'))
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(chat.swaps).toBe(1)
+
+  // The next run starts with it.
+  await start(false)
+  expect(chat.swaps).toBe(2)
+  expect(first()).toContain('Use spaces.')
+  await start(true)
+})
+
+test('in the desktop app the message is rewritten as in the terminal, once the app attaches', async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 9_600_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, attach, turn, changed } = conversation($, on)
+  await $.prompt.context(input)
+  // The app starts Claude Code with nothing drawing it; a file edited before it opens the chat is
+  // put in the message when it attaches.
+  await start(false)
+  expect(chat.swaps).toBe(1)
+  await write(PROJECT_MD, 'Use spaces.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(chat.swaps).toBe(1)
+  await attach()
+  await clock.advance(10)
+  expect(chat.swaps).toBe(2)
+  expect(first()).toContain('Use spaces.')
+
+  // Then as in the terminal: at once between turns, and when a turn ends.
+  await write(PROJECT_MD, 'Use both.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(chat.swaps).toBe(3)
+  expect(first()).toContain('Use both.')
+  await turn(async () => {
+    await write(PROJECT_MD, 'Use neither.')
+    await changed(PROJECT_MD)
+    await clock.advance(10)
+    expect(chat.swaps).toBe(3)
+  })
+  expect(chat.swaps).toBe(4)
+  expect(first()).toContain('Use neither.')
+  expect(chat.messages.filter(isOwn).length).toBe(1)
+  await start(true)
+})
+
+test('text another plugin rewrote is pinned until the files on disk change', async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 6_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Rule A.' }], { rewrittenAs: 'Rewritten rule A.' })
+  const { first, start, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  expect(first()).toContain('Rewritten rule A.')
+
+  write(PROJECT_MD, 'Rule B.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  expect(first()).toContain('Rule B.')
+  expect(first()).not.toContain('Rewritten rule A.')
+})
+
+test('the message reads back as the files it holds', () => {
+  const text = render({
+    files: [
+      { path: USER_MD, kind: 'user', content: 'Answer briefly.\n', mtimeMs: 1 },
+      { path: PROJECT_MD, kind: 'project', content: '# Rules\n\nUse tabs.\n\n(see notes)', mtimeMs: 1 },
+      { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` },
+    ],
+    raw: null,
+    source: 'engine',
+  })
+  expect(filesOf(text ?? '')).toEqual([
+    { path: USER_MD, kind: 'user', content: 'Answer briefly.', mtimeMs: -1 },
+    { path: PROJECT_MD, kind: 'project', content: '# Rules\n\nUse tabs.\n\n(see notes)', mtimeMs: -1 },
+    { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: -1, scope: `${PROJECT}/api` },
+  ])
+  expect(filesOf('hello')).toBeNull()
 })
 
 test('unpins a subfolder CLAUDE.md after 10 messages without work there', async ($, on) => {
-  const { clock, toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_000_000)
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_800_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { first, start, turn } = conversation($, on)
   tools(on)
   await $.prompt.context(input)
-  await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
+  await start()
+  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
 
   const send = async (count: number) => {
-    for (let i = 0; i < count; i++) await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
-    await clock.advance(1500)
-    return pinned((await $.prompt.compose(COMPOSE)).sections)?.text ?? ''
+    for (let i = 0; i < count; i++) await $.prompt.submit(SUBMIT)
+    await turn()
+    return first() ?? ''
   }
 
   // Work in the folder (a search counts) resets the count.
   expect(await send(6)).toContain('Validate every endpoint.')
-  await $.tool.call({ tool: 'Grep', tool_use_id: 't2', pattern: 'x', path: `${PROJECT}/api` })
+  await turn(() => $.tool.call({ tool: 'Grep', tool_use_id: 't2', pattern: 'x', path: `${PROJECT}/api` }))
   expect(await send(9)).toContain('Validate every endpoint.')
   const text = await send(1)
   expect(text).not.toContain('Validate every endpoint.')
@@ -321,13 +604,13 @@ test('unpins a subfolder CLAUDE.md after 10 messages without work there', async 
   expect(toasts.some(t => t.startsWith('CLAUDE.md unpinned:'))).toBe(true)
 
   // Opening a file there again pins it again.
-  await $.tool.call({ tool: 'Read', tool_use_id: 't3', file_path: API_FILE })
-  expect(await send(0)).toContain('Validate every endpoint.')
+  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't3', file_path: API_FILE }))
+  expect(first()).toContain('Validate every endpoint.')
 })
 
 test('each subfolder CLAUDE.md counts down on its own, and the startup files never unpin', async ($, on) => {
   const WEB_MD = `${PROJECT}/web/CLAUDE.md`
-  const { clock } = world(
+  world(
     on,
     {
       [PROJECT_MD]: 'Use tabs.',
@@ -336,16 +619,19 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
       [`${PROJECT}/docs/CLAUDE.md`]: 'Write in plain words.',
       [`${PROJECT}/lib/CLAUDE.md`]: 'No side effects.',
     },
-    9_500_000,
+    9_900_000,
   )
   tools(on)
-  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { first, start, turn } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
   await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
 
   const send = async (count: number) => {
-    for (let i = 0; i < count; i++) await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
-    await clock.advance(1500)
-    return pinned((await $.prompt.compose(COMPOSE)).sections)?.text ?? ''
+    for (let i = 0; i < count; i++) await $.prompt.submit(SUBMIT)
+    await turn()
+    return first() ?? ''
   }
 
   // The web folder's file is pinned 4 messages after the api folder's, so it unpins 4 messages later.
@@ -713,21 +999,14 @@ test('in the terminal the line sits under the hint line below the prompt, styled
 })
 
 test("another chat's band choice and an edited CLAUDE.md show here as soon as the files change", async ($, on) => {
-  on('classic.SessionStart', () => ({}))
-  on('classic.FileChanged', () => ({}))
   const { clock, stored, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 18_000_000)
-  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
-  const changed = (path: string) =>
-    $.classic.FileChanged({ session_id: 's1', transcript_path: '', cwd: PROJECT, hook_event_name: 'FileChanged', file_path: path, event: 'change' } as never)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { first, start, sessionStart, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
 
   // A fresh install keeps its choice first, so there is a store file to watch, beside the pinned files.
-  const started = await $.classic.SessionStart({
-    session_id: 's1',
-    transcript_path: '',
-    cwd: PROJECT,
-    hook_event_name: 'SessionStart',
-    source: 'startup',
-  } as never)
+  const started = await sessionStart('startup')
   expect(started.watchPaths).toEqual([STORE_FILE, PROJECT_MD])
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -751,169 +1030,20 @@ test("another chat's band choice and an edited CLAUDE.md show here as soon as th
   await changed(PROJECT_MD)
   await clock.advance(10)
   expect(toasts).toContain('CLAUDE.md changed: re-pinned')
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Use spaces.')
-})
-
-// Claude Code keeps a chat's system prompt as it was first sent, and sends it again only after a
-// compaction or /clear: a change in between reaches Claude as a note beside its next tool result,
-// or the person's next message.
-const UPDATE = '# CLAUDE.md (pinned): updated'
-const SUBMIT = { text: 'next', wait: false, origin: { kind: 'composer' } } as const
-
-/** The engine's SessionStart and FileChanged beneath the plugin, and ways to raise them. */
-function sessions($: Engine, on: On) {
-  on('classic.SessionStart', () => ({}))
-  on('classic.FileChanged', () => ({}))
-  return {
-    start: (source: 'startup' | 'resume' | 'clear' | 'compact' | 'fork', id = 's1') =>
-      $.classic.SessionStart({ session_id: id, transcript_path: '', cwd: PROJECT, hook_event_name: 'SessionStart', source } as never),
-    changed: (path: string) =>
-      $.classic.FileChanged({ session_id: 's1', transcript_path: '', cwd: PROJECT, hook_event_name: 'FileChanged', file_path: path, event: 'change' } as never),
-  }
-}
-
-/** What Claude reads beside a tool's result, and beside the person's next message, joined. */
-const besideResult = async ($: Engine, id: string) =>
-  ((await $.tool.call({ tool: 'Bash', tool_use_id: id, command: 'ls' })).context ?? []).join('\n')
-const besidePrompt = async ($: Engine) => ((await $.prompt.submit(SUBMIT)).context ?? []).join('\n')
-
-test('a CLAUDE.md edited mid-chat reaches Claude beside its next tool result, once', async ($, on) => {
-  const { start } = sessions($, on)
-  const { clock, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 19_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  tools(on)
-  await start('startup')
-  expect(await besidePrompt($)).toBe('')
-  await $.prompt.context(input)
-  await $.prompt.compose(COMPOSE)
-  expect(await besideResult($, 't1')).toBe('')
-
-  write(PROJECT_MD, 'Use spaces.')
-  await clock.advance(1500)
-  const note = await besideResult($, 't2')
-  expect(note).toContain(UPDATE)
-  expect(note).toContain('Use spaces.')
-  expect(note).not.toContain('Use tabs.')
-  expect(note).toContain(PROJECT_MD)
-  await clock.advance(1500)
-  expect(await besideResult($, 't3')).toBe('')
-
-  // A file created mid-chat, then one deleted: the next message carries each.
-  write(LOCAL_MD, 'My local rule.')
-  await clock.advance(1500)
-  expect(await besidePrompt($)).toContain('My local rule.')
-  remove(PROJECT_MD)
-  await clock.advance(1500)
-  const gone = await besidePrompt($)
-  expect(gone).toContain('No longer in force')
-  expect(gone).toContain(PROJECT_MD)
-  expect(gone).not.toContain('My local rule.')
-})
-
-test('a system prompt rendered only to measure it is not the one Claude keeps', async ($, on) => {
-  const { start } = sessions($, on)
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 19_500_000)
-  engine(on, null)
-  tools(on)
-  await start('startup')
-  await $.prompt.compose({ ...COMPOSE, traits: ['analysis'] })
-  write(PROJECT_MD, 'Rule B.')
-  await clock.advance(1500)
-  // The first real request takes Rule B into the system prompt: nothing to send beside it.
-  expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain('Rule B.')
-  expect(await besideResult($, 't1')).toBe('')
-})
-
-test('a subfolder CLAUDE.md pinned mid-chat reaches Claude with the file it opened, and its unpinning too', async ($, on) => {
-  const { start } = sessions($, on)
-  const { clock } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 20_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  tools(on)
-  await start('startup')
-  await $.prompt.context(input)
-  await $.prompt.compose(COMPOSE)
-
-  const ran = await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
-  const note = (ran.context ?? []).join('\n')
-  expect(note).toContain('Validate every endpoint.')
-  expect(note).toContain('apply when working in')
-  expect(note).not.toContain('Use tabs.')
-
-  let last = ''
-  for (let i = 0; i < 10; i++) {
-    await clock.advance(1500)
-    last = await besidePrompt($)
-    if (i < 9) expect(last).toBe('')
-  }
-  expect(last).toContain('No longer in force')
-  expect(last).toContain(API_MD)
-})
-
-test('after a compaction or /clear the new system prompt carries the files, with nothing sent twice', async ($, on) => {
-  const { start } = sessions($, on)
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 21_000_000)
-  tools(on)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  await start('startup')
-  await $.prompt.context(input)
-  await $.prompt.compose(COMPOSE)
-
-  for (const source of ['compact', 'clear'] as const) {
-    write(PROJECT_MD, `Use spaces (${source}).`)
-    await clock.advance(1500)
-    await start(source)
-    expect(await besidePrompt($)).toBe('')
-    expect(pinned((await $.prompt.compose(COMPOSE)).sections)?.text).toContain(`Use spaces (${source}).`)
-    expect(await besideResult($, `t-${source}`)).toBe('')
-  }
-})
-
-test('a resumed chat gets what changed while it was closed; one the plugin never saw gets everything once', async ($, on) => {
-  const { start } = sessions($, on)
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.', [USER_MD]: 'Answer briefly.' }, 22_000_000)
-  engine(on, null)
-  tools(on)
-  await start('startup', 's1')
-  await $.prompt.compose(COMPOSE)
-
-  // Reopened unchanged: nothing to send.
-  await start('resume', 's1')
-  await $.prompt.compose(COMPOSE)
-  expect(await besidePrompt($)).toBe('')
-
-  // Reopened after an edit: only that file.
-  write(PROJECT_MD, 'Use spaces.')
-  await clock.advance(1500)
-  await start('resume', 's1')
-  await $.prompt.compose(COMPOSE)
-  const note = await besidePrompt($)
-  expect(note).toContain('Use spaces.')
-  expect(note).not.toContain('Answer briefly.')
-
-  // A chat from before the plugin, or a fork: its system prompt is unknown, so every file, once.
-  for (const [source, id] of [['resume', 's-old'], ['fork', 's-fork']] as const) {
-    await start(source, id)
-    await $.prompt.compose(COMPOSE)
-    const all = await besidePrompt($)
-    expect(all).toContain('Use spaces.')
-    expect(all).toContain('Answer briefly.')
-    await clock.advance(1500)
-    expect(await besidePrompt($)).toBe('')
-  }
+  expect(first()).toContain('Use spaces.')
 })
 
 test('a CLAUDE.md that links to AGENTS.md is watched where it points, and re-pinned when that changes', async ($, on) => {
   const AGENTS_MD = `${PROJECT}/AGENTS.md`
-  const { start, changed } = sessions($, on)
   const { clock, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.', [AGENTS_MD]: 'Use tabs.' }, 23_000_000, {
     [PROJECT_MD]: AGENTS_MD,
   })
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  tools(on)
+  const { first, start, sessionStart, changed } = conversation($, on)
   await $.prompt.context(input)
-  const started = await start('startup')
+  await start()
+  const started = await sessionStart('startup')
   expect(started.watchPaths).toContain(AGENTS_MD)
-  await $.prompt.compose(COMPOSE)
 
   // An edit to AGENTS.md is an edit to CLAUDE.md, reported by the target's name.
   write(AGENTS_MD, 'Use spaces.')
@@ -921,5 +1051,5 @@ test('a CLAUDE.md that links to AGENTS.md is watched where it points, and re-pin
   await changed(AGENTS_MD)
   await clock.advance(10)
   expect(toasts).toContain('CLAUDE.md changed: re-pinned')
-  expect(await besideResult($, 't1')).toContain('Use spaces.')
+  expect(first()).toContain('Use spaces.')
 })

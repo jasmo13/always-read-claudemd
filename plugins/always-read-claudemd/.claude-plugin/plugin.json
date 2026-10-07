@@ -1,7 +1,7 @@
 {
   "name": "always-read-claudemd",
-  "version": "0.6.0",
-  "description": "Pins your CLAUDE.md into the system prompt so its rules survive compaction and are re-synced before every model request.",
+  "version": "0.7.0",
+  "description": "Keeps your CLAUDE.md as the first message of every chat, word for word, rewritten when the files change and put back after every compaction.",
   "author": { "name": "Jake Campbell" },
   "license": "MIT",
   "types": "./types/index.d.ts"

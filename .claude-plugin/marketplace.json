@@ -5,7 +5,7 @@
     {
       "name": "always-read-claudemd",
       "source": "./plugins/always-read-claudemd",
-      "description": "Pins your CLAUDE.md into the system prompt so its rules survive compaction and are re-synced before every model request."
+      "description": "Keeps your CLAUDE.md as the first message of every chat, word for word, rewritten when the files change and put back after every compaction."
     }
   ]
 }
