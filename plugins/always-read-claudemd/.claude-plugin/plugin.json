@@ -1,6 +1,6 @@
 {
   "name": "always-read-claudemd",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Keeps your CLAUDE.md as the first message of every chat, word for word, rewritten when the files change and put back after every compaction.",
   "author": { "name": "Jake Campbell" },
   "license": "MIT",

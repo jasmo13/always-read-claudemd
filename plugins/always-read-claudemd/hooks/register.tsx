@@ -45,6 +45,8 @@ const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as c
 const running = new Set<string>()
 // Whether the CLAUDE.md message is being rewritten, so a second change waits for the first.
 let isSwapping = false
+// How many prompts the chat held when last drawn, so a rewind, which takes some away, is noticed.
+let promptsSeen = 0
 /**
  * Whether someone is watching the chat: the terminal, or an app showing it (the desktop app attaches
  * when it opens a chat). A run with neither (-p, a bare SDK app) prints the last result it has, and a
@@ -105,6 +107,18 @@ async function lastWritten($: EngineInterface, transcript: string): Promise<stri
     if (row.type === 'user' && isMessage(text)) return text
   }
   return null
+}
+
+/**
+ * A rewind restores the chat as it was, CLAUDE.md message included, and that message can be older
+ * than the files: the chat holds fewer prompts than before, and the message is brought in step with
+ * disk before the next one.
+ */
+async function noticeRewind($: EngineInterface) {
+  const prompts = await $.session.turns()
+  const isBack = prompts < promptsSeen
+  promptsSeen = prompts
+  if (isBack && running.size === 0) await refresh($)
 }
 
 /** The CLAUDE.md message a chat opened in this process last had: its transcript's when resumed. */
@@ -677,6 +691,8 @@ export const register: Register = on => {
   // plugin's band. The terminal draws the same line under the prompt instead (see PromptHint).
   // Colors are theme keys or dim alone, never raw, so it reads in light and dark themes.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Claude Code redraws this slot after a rewind, on every surface.
+    void noticeRewind($).catch(() => undefined)
     if (e.surface === 'terminal' || e.props.hasSurvey || !(await read($, bandAtom))) return next(e)
 
     // The slot holds one tree, so draw the other plugins' bands too rather than replacing them,

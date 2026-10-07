@@ -151,8 +151,9 @@ const isOwn = (m: SessionMessage) => m.role === 'user' && isMessage(m.text)
  * and the classic hooks pass through.
  */
 function conversation($: Engine, on: On, messages: SessionMessage[] = [MESSAGE, REPLY]) {
-  const chat = { messages, swaps: 0, summaries: 0, surfaces: ['terminal'] as RenderSurface[] }
+  const chat = { messages, prompts: 1, swaps: 0, summaries: 0, surfaces: ['terminal'] as RenderSurface[] }
   on('session.messages', () => ({ value: [...chat.messages] }) as never)
+  on('session.turns', () => ({ value: chat.prompts }) as never)
   on('session.surfaces', () => ({ value: [...chat.surfaces] }) as never)
   on('command.run', { command: 'compact' }, async (_$, e) => {
     const done = await $.session.compact({ trigger: 'manual', messages: chat.messages, instructions: e.args })
@@ -317,6 +318,44 @@ test('between turns an edit rewrites the message at once; during a turn, when th
   await turn()
   expect(chat.swaps).toBe(3)
   expect(first()).toContain('Use four spaces.')
+})
+
+test('a rewind brings back the message the chat had then; it is rewritten from disk before the next prompt', async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_200_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  const before = [...chat.messages]
+  // Claude Code draws the slot above the prompt whenever the chat changes.
+  const redraw = async () => {
+    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...BAND })
+    await clock.advance(10)
+    await band.unmount()
+  }
+  chat.prompts = 3
+  await redraw()
+
+  write(PROJECT_MD, 'Use two spaces.')
+  await changed(PROJECT_MD)
+  await clock.advance(10)
+  chat.prompts = 5
+  await redraw()
+  expect(chat.swaps).toBe(2)
+
+  // Rewound to before that rewrite: the chat holds the old message, and fewer prompts.
+  chat.messages = before
+  chat.prompts = 3
+  await redraw()
+  expect(chat.swaps).toBe(3)
+  expect(first()).toContain('Use two spaces.')
+  expect(chat.messages.filter(isOwn).length).toBe(1)
+  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
+
+  // A rewind to a point whose message is current leaves the chat alone.
+  chat.prompts = 2
+  await redraw()
+  expect(chat.swaps).toBe(3)
 })
 
 test('a new file and a deleted file rewrite the message too', async ($, on) => {
