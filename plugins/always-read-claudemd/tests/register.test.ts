@@ -13,6 +13,8 @@ const API_MD = `${PROJECT}/api/CLAUDE.md`
 const API_FILE = `${PROJECT}/api/orders.ts`
 // The plugin's file in Claude Code's store, which every chat watches.
 const STORE_FILE = `${HOME}/.claude/plugins/store/always-read-claudemd_inline-abc123.json`
+// Another plugin's file there, which Claude Code also tells this plugin about.
+const OTHER_STORE_FILE = `${HOME}/.claude/plugins/store/usage-mod_inline-def456.json`
 
 const COMPOSE = {
   model: 'claude-opus-5-5',
@@ -356,6 +358,30 @@ test('a rewind brings back the message the chat had then; it is rewritten from d
   chat.prompts = 2
   await redraw()
   expect(chat.swaps).toBe(3)
+})
+
+test("another plugin's store file is left alone; the files are checked once a second", async ($, on) => {
+  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_300_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, first, start, changed } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+
+  // A CLAUDE.md created where there was none: nothing watched it, so no event says so.
+  write(USER_MD, 'Answer briefly.')
+  // Another plugin saved its own file: not a CLAUDE.md change.
+  await changed(OTHER_STORE_FILE)
+  await clock.advance(10)
+  expect(chat.swaps).toBe(1)
+
+  // Within a second, it's in the message.
+  await clock.advance(1000)
+  expect(chat.swaps).toBe(2)
+  expect(first()).toContain('Answer briefly.')
+
+  // With nothing changed, the checks leave the chat alone.
+  await clock.advance(5000)
+  expect(chat.swaps).toBe(2)
 })
 
 test('a new file and a deleted file rewrite the message too', async ($, on) => {

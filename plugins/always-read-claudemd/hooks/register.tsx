@@ -121,6 +121,15 @@ async function noticeRewind($: EngineInterface) {
   if (isBack && running.size === 0) await refresh($)
 }
 
+/**
+ * Checks the files: between turns, in a chat someone is watching, the CLAUDE.md message is
+ * rewritten at once if they changed; otherwise they're re-read, and it's rewritten when the turn ends.
+ */
+async function check($: EngineInterface) {
+  if (running.size === 0 && (await isWatched($))) await refresh($)
+  else await sync($)
+}
+
 /** The CLAUDE.md message a chat opened in this process last had: its transcript's when resumed. */
 async function lastHeld($: EngineInterface) {
   return (await resumed.catch(() => null)) ?? (await heldText($))
@@ -496,6 +505,9 @@ export const register: Register = on => {
     await recall($).catch(() => undefined)
     // A new chat gets its CLAUDE.md message first; a resumed one has it rewritten if the files changed.
     await refresh($).catch(() => undefined)
+    // Only files that exist are watched: once a second the files are checked too, so a CLAUDE.md
+    // created where there was none is pinned within a second.
+    $.clock.every(1000, () => void check($).catch(() => undefined))
 
     return started
   })
@@ -521,12 +533,13 @@ export const register: Register = on => {
     return watched.length === 0 ? result : { ...result, watchPaths: [...(result.watchPaths ?? []), ...watched] }
   })
 
-  // Known by name, so a hot reload (which keeps the watch but forgets the module's variables) still
-  // hears it. Every other watched path is an instruction file, or the file one links to: between
-  // turns the CLAUDE.md message is rewritten at once, during one when the turn ends.
+  // Claude Code tells every plugin of every watched file's change, other plugins' store files too:
+  // those are theirs. This plugin's own store file is known by name, so a hot reload (which keeps
+  // the watch but forgets the module's variables) still hears it. Every other path is an instruction
+  // file, or the file one links to.
   on('classic.FileChanged', ($, e, next) => {
     if (isStoreFile(e.file_path)) void followBand($).catch(() => undefined)
-    else void isWatched($).then(isOn => (running.size === 0 && isOn ? refresh($) : sync($))).catch(() => undefined)
+    else if (!keyOf(e.file_path).includes('/plugins/store/')) void check($).catch(() => undefined)
     return next(e)
   })
 

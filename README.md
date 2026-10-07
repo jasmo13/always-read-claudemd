@@ -16,7 +16,7 @@ The message is a system reminder, wrapped in the same `<system-reminder>` tags C
 | --- | --- |
 | A chat starts | The plugin puts the `CLAUDE.md` message first. It holds every file Claude Code loaded: managed, user `~/.claude/CLAUDE.md`, project, `CLAUDE.local.md`, rules, auto-memory and `@imports`. From then on, Claude Code's own copy is left out of what Claude reads, so nothing is there twice. |
 | A chat is resumed | If the files are unchanged, nothing happens. If they changed while it was closed, the message is rewritten before Claude reads anything. Subfolder files the message held stay pinned. |
-| A pinned `CLAUDE.md` is edited, created or deleted between turns | The message is rewritten at once, in every open chat, with a toast: *CLAUDE.md changed: re-pinned*. The old text is gone from the chat, not just superseded. |
+| A pinned `CLAUDE.md` is edited, created or deleted between turns | The message is rewritten at once, in every open chat, with a toast: *CLAUDE.md changed: re-pinned*. A file created where there was none is in it within a second. The old text is gone from the chat, not just superseded. |
 | A file changes while Claude is working, or Claude edits it | The message is rewritten as soon as the turn ends, before your next message. |
 | Compaction (`/compact` or auto) | Claude Code summarizes the chat as usual. The `CLAUDE.md` message is then put back first, whole, never summarized. |
 | `/clear` | The chat is emptied, and the `CLAUDE.md` message is put back. |
@@ -104,7 +104,7 @@ Every file is named by where it is, with `~` for your home folder, so a project'
 
 `/claudemd` opens the pane, on the list of files, or closes it when it's open. Pinning runs in the background either way.
 
-Apart from the `CLAUDE.md` message and the */compact* lines each rewrite leaves, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are watched and re-checked at every turn. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
+Apart from the `CLAUDE.md` message and the */compact* lines each rewrite leaves, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are watched, and checked again every second and at every turn. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
 
 ## Installing
 
