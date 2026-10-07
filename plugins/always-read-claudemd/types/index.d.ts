@@ -32,17 +32,10 @@ export type Pin = {
 /** The latest change to what is pinned, as the pane words it. */
 export type PinChange = { text: string; turn: number }
 
-/**
- * What Claude holds of the pin, from the system prompt and the notes since: each part's path and
- * a fingerprint of its text, by key (a file's lower-case path with forward slashes, or `raw`).
- */
-export type Seen = Record<string, { path: string; hash: string }>
-
 declare module 'claude-code' {
   interface PluginState {
     'always-read-claudemd': {
       pin: Pin
-      checkedAt: number | null
       /** User messages sent this session; subfolder pins age by it. */
       turn: number
       lastChange: PinChange | null
@@ -51,16 +44,6 @@ declare module 'claude-code' {
       viewing: string | null
       /** How many rows the pane's body is scrolled, under its fixed toolbar. */
       paneTop: number
-      /**
-       * What Claude holds of the pin. Claude Code keeps a chat's system prompt as first sent until a
-       * compaction or /clear, so a change in between reaches Claude as a note; null when unknown
-       * (a chat from before the plugin, or a fork), when every part goes in the next note.
-       */
-      seen: Seen | null
-      /** Whether the next system prompt sent is a new one Claude keeps: at a chat's start, a compaction or /clear. */
-      isSnapshotDue: boolean
-      /** The chat's id, which keeps what Claude holds of the pin across a resume. */
-      sessionId: string | null
     }
   }
 }

@@ -1,8 +1,5 @@
-import type { Pin, PinnedFile, Seen } from '../types'
+import type { Pin, PinnedFile } from '../types'
 
-export const SECTION_ID = 'always-read-claudemd:claudemd'
-// The most often the files are re-checked; each check is a few stats.
-export const THROTTLE_MS = 1000
 // Where an instruction file can appear in a directory.
 export const PROJECT_NAMES = ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md']
 // A subfolder's CLAUDE.md is unpinned after this many user messages with no work in its folder.
@@ -29,20 +26,26 @@ export const TIERS: Record<string, string> = {
 
 const OVERRIDE = 'IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.'
 
-const HEADER = [
-  '# CLAUDE.md (pinned)',
+// The first line and paragraph of the CLAUDE.md message, which is how it is found again.
+export const HEADER = [
+  '# CLAUDE.md',
   '',
-  "These are the user's CLAUDE.md instructions. They are pinned in the system prompt, so they stay in force for the whole session, including after the conversation is compacted or summarized, and they are re-synced from disk whenever the files change.",
-  'When the files change during the session, the change arrives as a "CLAUDE.md (pinned): updated" note, which replaces the matching parts of this copy.',
-  OVERRIDE,
+  "This is the CLAUDE.md file: the user's instructions, exactly as they are on disk now. This message is kept first in the conversation and rewritten whenever the files change, so where anything later in the conversation disagrees with it, this message is current. " +
+    OVERRIDE,
 ].join('\n')
 
-const UPDATE_HEADER = [
-  '# CLAUDE.md (pinned): updated',
-  '',
-  "The user's CLAUDE.md instructions changed during this session. This note replaces the matching parts of the pinned CLAUDE.md in the system prompt; the rest of it is unchanged and still in force.",
-  OVERRIDE,
-].join('\n')
+// The CLAUDE.md message is a system reminder, in the tags Claude Code wraps its own in.
+const OPEN = '<system-reminder>'
+const CLOSE = '</system-reminder>'
+
+/** What a system reminder says inside its tags; null for text that isn't one. */
+function unwrap(text: string): string | null {
+  const trimmed = text.trim()
+  return trimmed.startsWith(OPEN) && trimmed.endsWith(CLOSE) ? trimmed.slice(OPEN.length, -CLOSE.length).trim() : null
+}
+
+/** Whether a message's text is the CLAUDE.md message. */
+export const isMessage = (text: string) => unwrap(text)?.startsWith(HEADER) === true
 
 export const keyOf = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
@@ -63,65 +66,53 @@ export function pathsOf(input: Record<string, unknown>): string[] {
   })
 }
 
+const SUBFOLDER = 'subfolder instructions; apply when working in '
+
 function section(file: PinnedFile): string {
-  const label =
-    file.scope === undefined
-      ? (LABELS[file.kind] ?? file.kind)
-      : `subfolder instructions; apply when working in ${file.scope}`
+  const label = file.scope === undefined ? (LABELS[file.kind] ?? file.kind) : `${SUBFOLDER}${file.scope}`
   return `Contents of ${file.path} (${label}):\n\n${file.content.trim()}`
 }
 
-/** One part of the pin as the model reads it: a file's section, or the text another plugin rewrote. */
-type Part = { key: string; path: string; text: string }
+const SECTION = /^Contents of (.+) \(([^()]+)\):$/
 
-const RAW_PATH = 'CLAUDE.md, as another plugin rewrote it'
-
-function partsOf(pin: Pin): Part[] {
-  const nested = pin.files.filter(f => f.scope !== undefined)
-  const shown = pin.source === 'raw' ? nested : pin.files
-  const raw = (pin.raw ?? '').trim()
-  return [
-    ...(pin.source === 'raw' && raw !== '' ? [{ key: 'raw', path: RAW_PATH, text: raw }] : []),
-    ...shown.filter(f => f.content.trim() !== '').map(f => ({ key: keyOf(f.path), path: f.path, text: section(f) })),
-  ]
-}
-
-/** The pinned text the model reads, or null when there is nothing to pin. */
-export function render(pin: Pin): string | null {
-  const parts = partsOf(pin)
-  return parts.length === 0 ? null : `${HEADER}\n\n${parts.map(p => p.text).join('\n\n')}`
-}
-
-/** A short fingerprint of a text (FNV-1a), so what Claude holds is kept without the text itself. */
-function hashOf(text: string): string {
-  let hash = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193)
-  return `${(hash >>> 0).toString(16)}:${text.length}`
-}
-
-/** What Claude holds of a pin: each part's path and fingerprint, by key. */
-export function seenOf(pin: Pin): Seen {
-  return Object.fromEntries(partsOf(pin).map(p => [p.key, { path: p.path, hash: hashOf(p.text) }]))
+/** What a section's label says of its file: its tier, and its folder for a subfolder's file. */
+function labelled(path: string, label: string): Pick<PinnedFile, 'kind' | 'scope'> | null {
+  if (label.startsWith(SUBFOLDER)) {
+    return { kind: /CLAUDE\.local\.md$/i.test(path) ? 'local' : 'project', scope: label.slice(SUBFOLDER.length) }
+  }
+  const kind = Object.keys(LABELS).find(k => LABELS[k] === label) ?? (/^[a-z]+$/.test(label) ? label : undefined)
+  return kind === undefined ? null : { kind }
 }
 
 /**
- * The note that brings Claude from what it holds (`seen`) to the pin: each new or changed part in
- * full, and the paths no longer in force. Null when Claude already holds the pin.
+ * The files a CLAUDE.md message holds, read back from its text, so a resumed chat knows what Claude
+ * holds; null when the text is not one. Their mtimes are unknown, so the next sync re-reads them.
  */
-export function updateOf(seen: Seen, pin: Pin): string | null {
-  const parts = partsOf(pin)
-  const changed = parts.filter(p => seen[p.key]?.hash !== hashOf(p.text))
-  const keys = new Set(parts.map(p => p.key))
-  const gone = Object.entries(seen).flatMap(([key, { path }]) => (keys.has(key) ? [] : [path]))
-  if (changed.length === 0 && gone.length === 0) return null
+export function filesOf(text: string): PinnedFile[] | null {
+  const body = unwrap(text)
+  if (body === null || !body.startsWith(HEADER)) return null
+  const files: (PinnedFile & { lines: string[] })[] = []
+  for (const line of body.slice(HEADER.length).split('\n')) {
+    const [, path = '', label = ''] = SECTION.exec(line) ?? []
+    const tier = path === '' ? null : labelled(path, label)
+    if (tier !== null) files.push({ path, ...tier, content: '', mtimeMs: -1, lines: [] })
+    else files.at(-1)?.lines.push(line)
+  }
+  return files.map(({ lines, ...file }) => ({ ...file, content: lines.join('\n').trim() }))
+}
 
-  return [
-    UPDATE_HEADER,
-    ...changed.map(p => p.text),
-    ...(gone.length === 0
-      ? []
-      : [`No longer in force (deleted, emptied or unpinned); stop following these files' instructions: ${gone.join(', ')}`]),
-  ].join('\n\n')
+/** The pin as the model reads it, part by part: the text another plugin rewrote, then each file's section. */
+function partsOf(pin: Pin): string[] {
+  const nested = pin.files.filter(f => f.scope !== undefined)
+  const shown = pin.source === 'raw' ? nested : pin.files
+  const raw = (pin.raw ?? '').trim()
+  return [...(pin.source === 'raw' && raw !== '' ? [raw] : []), ...shown.filter(f => f.content.trim() !== '').map(section)]
+}
+
+/** The CLAUDE.md message the model reads, as a system reminder, or null when there is nothing to pin. */
+export function render(pin: Pin): string | null {
+  const parts = partsOf(pin)
+  return parts.length === 0 ? null : `${OPEN}\n${HEADER}\n\n${parts.join('\n\n')}\n${CLOSE}`
 }
 
 /** How many files the pin carries, as the band and status line count them. */
