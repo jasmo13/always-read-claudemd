@@ -13,8 +13,8 @@ The system prompt is sent with every request and is never summarized. This plugi
 | When | What happens |
 | --- | --- |
 | Conversation starts | The plugin captures the `CLAUDE.md` block Claude Code built (every tier: managed, user `~/.claude/CLAUDE.md`, project, `CLAUDE.local.md`, auto-memory, `@imports`). It removes that block from the first message and pins it at the end of the system prompt instead, so nothing is duplicated. |
-| Before **every** model request | It re-checks the files on disk, at most once a second. Edits, newly created files and deletions are picked up at Claude's next step, even partway through a turn. It shows a toast: *CLAUDE.md changed: re-pinned*. |
-| A pinned `CLAUDE.md` is edited, by anyone | Every open chat re-pins it at once, without waiting for its next message, and shows the same toast. |
+| Before **every** model request | It re-checks the files on disk, at most once a second. Edits, newly created files and deletions are picked up at Claude's next step, even partway through a turn, and reach Claude as described in [How changes reach Claude](#how-changes-reach-claude). It shows a toast: *CLAUDE.md changed: re-pinned*. |
+| A pinned `CLAUDE.md` is edited, by anyone, while chats are open | Every open chat re-reads it at once, without waiting for its next message, shows the same toast, and hands Claude the new text at its next step. |
 | Compaction (`/compact` or auto) | It tells the summarizer the rules are pinned and still in force, and asks it to keep any decisions or exceptions about them verbatim. Anything you typed after `/compact` stays first. |
 | No `CLAUDE.md` anywhere | It does nothing and adds no tokens. Its line reads *No CLAUDE.md found*. |
 | Claude opens a file in a subfolder with its own `CLAUDE.md` | It pins that subfolder's file too, marked *apply when working in &lt;folder&gt;*, and shows a toast with where it is: *CLAUDE.md pinned: ~/app/api/CLAUDE.md*. |
@@ -24,6 +24,7 @@ The system prompt is sent with every request and is never summarized. This plugi
 
 - **At startup:** whatever Claude Code itself loads. That's `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md`), plus `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working directory and every folder above it, and files such as `.claude/rules/*.md`. All of them are pinned, top-level folder first.
 - **Before each request:** the same user-level and parent-folder locations, so a file created there mid-chat is picked up.
+- **Symlinks:** a `CLAUDE.md` that is a symbolic link, say to an `AGENTS.md`, is read through the link and watched where it points, so editing `AGENTS.md` re-pins it like editing the `CLAUDE.md` itself.
 - **Subfolders:** a subfolder's `CLAUDE.md` is pinned once Claude opens a file in that folder (Read, Edit, Write, MultiEdit or NotebookEdit). Only folders Claude actually works in are pinned, so the rest of the repo costs nothing.
 
 ### Subfolder files
@@ -31,6 +32,19 @@ The system prompt is sent with every request and is never summarized. This plugi
 A subfolder's file stays pinned while Claude keeps working in that folder. Any tool call with a path inside it counts, searches included, and resets the count. After 10 of your messages with no work there, the file is unpinned. It also survives compaction and `/clear`, like the startup files.
 
 Claude Code also adds the subfolder's file to the conversation by itself when Claude first opens a file there. That copy is an ordinary message, so it can appear twice until the next compaction removes it.
+
+## How changes reach Claude
+
+Claude Code builds a chat's system prompt once, when the chat starts, and keeps sending that same prompt until the chat is compacted or cleared with `/clear`. A change to the files in between can't go into the system prompt Claude reads, so the plugin hands it to Claude another way:
+
+- **Partway through a turn,** the change rides along with the result of Claude's next tool call.
+- **Otherwise,** it rides along with your next message.
+
+Either way it's a note headed *CLAUDE.md (pinned): updated*, which only Claude sees. It carries each new or edited file in full, and names any file deleted, emptied or unpinned, so Claude stops following it. Each change is sent once. The next compaction or `/clear` builds a fresh system prompt with everything in it, and the notes are no longer needed.
+
+The same goes for subfolder files: pinning one hands Claude its text with the result of the tool call that opened the folder, and unpinning one tells Claude it no longer applies.
+
+Resuming a chat picks up where it left off: Claude gets only what changed while the chat was closed. A chat from before the plugin was installed, or a forked chat, gets every file once, in its first note.
 
 ## The line and the pane
 
@@ -130,8 +144,8 @@ The plugin lives in `plugins/always-read-claudemd/`; the repository root holds t
 
 | Path | Contents |
 | --- | --- |
-| `hooks/register.tsx` | Hooks: capturing the CLAUDE.md block, pinning it in the system prompt, re-syncing from disk, subfolder pins, the compaction note, the band and the pane |
-| `hooks/pin.ts` | Pure helpers: the pinned text, paths, token estimates |
+| `hooks/register.tsx` | Hooks: capturing the CLAUDE.md block, pinning it in the system prompt, re-syncing from disk, the update notes, subfolder pins, the compaction note, the band and the pane |
+| `hooks/pin.ts` | Pure helpers: the pinned text, the update notes, paths, token estimates |
 | `tests/register.test.ts` | Tests |
 | `types/index.d.ts` | Types for the values the plugin keeps between reloads |
 | `.claude-plugin/plugin.json` | The plugin's manifest and version |

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { ClientElements, EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { Pin, PinnedFile } from '../types'
+import type { Pin, PinnedFile, Seen } from '../types'
 import {
   FILE_TOOLS,
   PROJECT_NAMES,
@@ -23,8 +23,10 @@ import {
   bandLayout,
   scrollBar,
   scrolled,
+  seenOf,
   tabTitle,
   tokensOf,
+  updateOf,
 } from './pin'
 
 const PANE = 'always-read-claudemd'
@@ -40,6 +42,16 @@ const changeAtom = atom({ plugin: 'always-read-claudemd', key: 'lastChange' } as
 const bandAtom = atom({ plugin: 'always-read-claudemd', key: 'isBandShown' } as const, true)
 const viewingAtom = atom({ plugin: 'always-read-claudemd', key: 'viewing' } as const, null)
 const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as const, 0)
+const seenAtom = atom({ plugin: 'always-read-claudemd', key: 'seen' } as const, null)
+// Until SessionStart says otherwise, the chat is new: its first system prompt is the one it keeps.
+const snapshotAtom = atom({ plugin: 'always-read-claudemd', key: 'isSnapshotDue' } as const, true)
+const sessionAtom = atom({ plugin: 'always-read-claudemd', key: 'sessionId' } as const, null)
+
+// What Claude holds of the pin in each chat, kept in the store so a resumed chat knows it.
+const SEEN_KEY = 'seen'
+// How many chats' records are kept, the most recently used first.
+const SEEN_KEPT = 100
+type SeenStore = Record<string, { at: number; seen: Seen }>
 
 const COMPACT_NOTE =
   "The user's CLAUDE.md instructions are pinned in the system prompt and remain in force after this compaction. In the summary, keep every user decision, correction or exception about those instructions, verbatim where possible; do not paraphrase, weaken or drop them."
@@ -173,8 +185,61 @@ async function storeFiles($: EngineInterface): Promise<string[]> {
 /** Whether a path is one of the plugin's store files, in either slash and any case, as Windows allows. */
 const isStoreFile = (path: string) => /\/plugins\/store\/always-read-claudemd_[^/]*\.json$/.test(keyOf(path))
 
-/** Whether a path is an instruction file by its name: CLAUDE.md or CLAUDE.local.md. */
-const isInstructionFile = (path: string) => /(^|\/)claude(\.local)?\.md$/.test(keyOf(path))
+/** Where each of these paths leads when it's a symbolic link, such as a CLAUDE.md that points to AGENTS.md. */
+async function linkTargets($: EngineInterface, paths: string[]): Promise<string[]> {
+  const targets: string[] = []
+  for (const path of paths) {
+    const real = (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath
+    if (real !== undefined && keyOf(real) !== keyOf(path)) targets.push(real)
+  }
+  return targets
+}
+
+/** The store's record of what Claude holds of the pin in chat `id`; null when there is none. */
+async function storedSeen($: EngineInterface, id: string): Promise<Seen | null> {
+  const stored = (await $.store.get(SEEN_KEY).catch(() => undefined)) as SeenStore | undefined
+  return typeof stored === 'object' && stored !== null ? (stored[id]?.seen ?? null) : null
+}
+
+/** Records what Claude now holds of the pin, here and in the store for when the chat is resumed. */
+async function keepSeen($: EngineInterface, seen: Seen) {
+  await update($, seenAtom, () => seen)
+  const id = await read($, sessionAtom)
+  if (id === null) return
+  const stored = (await $.store.get(SEEN_KEY).catch(() => undefined)) as SeenStore | undefined
+  const others = typeof stored === 'object' && stored !== null ? Object.entries(stored).filter(([key]) => key !== id) : []
+  const kept = [[id, { at: await $.clock.now(), seen }] as const, ...others.sort(([, a], [, b]) => b.at - a.at)]
+  await $.store.set(SEEN_KEY, Object.fromEntries(kept.slice(0, SEEN_KEPT))).catch(() => undefined)
+}
+
+/**
+ * A chat starts, is resumed or forked, or starts over after a compaction or /clear. A new start's
+ * next system prompt is the one Claude keeps; a resumed chat keeps the one it had, so what Claude
+ * holds comes from the store, unknown for a chat from before the plugin or a fork.
+ */
+async function begin($: EngineInterface, id: string, source: string) {
+  await update($, sessionAtom, () => id)
+  const isCarried = source === 'resume' || source === 'fork'
+  await update($, snapshotAtom, () => !isCarried)
+  if (isCarried) {
+    const seen = await storedSeen($, id)
+    await update($, seenAtom, () => seen)
+  }
+}
+
+/**
+ * The note that brings Claude up to date with the pin, once: what changed since the system prompt
+ * or the last note. Null when Claude holds the pin, or a new system prompt is about to carry it.
+ */
+async function noteFor($: EngineInterface): Promise<string | null> {
+  if (await read($, snapshotAtom)) return null
+  await sync($).catch(() => undefined)
+  const pin = await read($, pinAtom)
+  const seen = await read($, seenAtom)
+  const note = updateOf(seen ?? {}, pin)
+  if (note !== null || seen === null) await keepSeen($, seenOf(pin))
+  return note
+}
 
 /** Shows or hides the band as it was last chosen, in this chat or another. */
 async function followBand($: EngineInterface) {
@@ -412,21 +477,29 @@ export const register: Register = on => {
     return started
   })
 
-  // Every chat watches the plugin's store files and the CLAUDE.md files it pins, so a choice made in
-  // another chat, or a file edited anywhere, shows in each open chat at once, not at its next message.
+  // Every chat watches the plugin's store files and the CLAUDE.md files it pins, and where any of
+  // them links to, so a choice made in another chat, or a file edited anywhere, shows in each open
+  // chat at once, not at its next message.
   on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
+    if (e.agent_id === undefined) await begin($, e.session_id, e.source).catch(() => undefined)
     const pinned = (await read($, pinAtom)).files.map(f => f.path)
     const found = (await discover($).catch(() => [])).map(f => f.path)
-    const files = [...(await storeFiles($).catch(() => [])), ...pinned, ...found]
+    const instructions = [...pinned, ...found]
+    const files = [
+      ...(await storeFiles($).catch(() => [])),
+      ...instructions,
+      ...(await linkTargets($, instructions).catch(() => [])),
+    ]
     const watched = files.filter((path, i) => files.findIndex(p => keyOf(p) === keyOf(path)) === i)
     return watched.length === 0 ? result : { ...result, watchPaths: [...(result.watchPaths ?? []), ...watched] }
   })
 
-  // Known by name, so a hot reload (which keeps the watch but forgets the module's variables) still hears it.
+  // Known by name, so a hot reload (which keeps the watch but forgets the module's variables) still
+  // hears it. Every other watched path is an instruction file, or the file one links to.
   on('classic.FileChanged', ($, e, next) => {
     if (isStoreFile(e.file_path)) void followBand($).catch(() => undefined)
-    else if (isInstructionFile(e.file_path)) void sync($, { force: true }).catch(() => undefined)
+    else void sync($, { force: true }).catch(() => undefined)
     return next(e)
   })
 
@@ -483,13 +556,20 @@ export const register: Register = on => {
     return { blocks: context.blocks.filter(b => b !== block) }
   })
 
-  // Every model request: re-sync from disk, then pin the text last in the system prompt.
+  // Every model request: re-sync from disk, then pin the text last in the system prompt. Claude Code
+  // keeps the first one a chat sends, and again after a compaction or /clear, so that render is what
+  // Claude holds; a render only to measure the prompt (/context) is never sent.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     if (e.traits.includes('bare')) return composed
 
     await sync($).catch(() => undefined)
-    const text = render(await read($, pinAtom))
+    const pin = await read($, pinAtom)
+    if (!e.traits.includes('analysis') && (await read($, snapshotAtom))) {
+      await update($, snapshotAtom, () => false)
+      await keepSeen($, seenOf(pin)).catch(() => undefined)
+    }
+    const text = render(pin)
     if (text === null) return composed
 
     return {
@@ -500,18 +580,25 @@ export const register: Register = on => {
     }
   })
 
+  // A change since the system prompt rides with the person's next message, which Claude reads and
+  // they never see.
   on('prompt.submit', async ($, e, next) => {
     await age($).catch(() => undefined)
+    const note = await noteFor($).catch(() => null)
 
-    return next(e)
+    return next(note === null ? e : { ...e, context: [...(e.context ?? []), note] })
   })
 
+  // Or with Claude's next tool result, so a change made mid-turn applies from its next step. Only
+  // in the main chat: a subagent's results never reach it.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     const paths = pathsOf(e as unknown as Record<string, unknown>)
     await touch($, paths, FILE_TOOLS.has(e.tool)).catch(() => undefined)
+    if (ran.deny !== undefined || e.agentId !== undefined) return ran
+    const note = await noteFor($).catch(() => null)
 
-    return ran
+    return note === null ? ran : { ...ran, context: [...(ran.context ?? []), note] }
   })
 
   // Synchronous on purpose: nothing here can fail and hold up a compaction.
