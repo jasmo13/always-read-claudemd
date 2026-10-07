@@ -150,7 +150,7 @@ npx -p typescript tsc -p .
 claude plugin validate .
 ```
 
-`tsc` reads the `tsconfig.json` and types Claude Code writes into the plugin folder the first time it loads the plugin, for example with `claude --plugin-dir`. Both are git-ignored.
+`tsc` reads `tsconfig.json`, which points to the types Claude Code writes into the plugin's `.claude-plugin/types/` folder the first time it loads the plugin, for example with `claude --plugin-dir`. Git ignores that folder through a `.gitignore` Claude Code writes inside it.
 
 In the same pull request:
 
