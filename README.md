@@ -103,7 +103,7 @@ Every file is named by where it is, with `~` for your home folder, so a project'
 
 `/claudemd` opens the pane, on the list of files, or closes it when it's open. Pinning runs in the background either way.
 
-Apart from the `CLAUDE.md` message, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are watched and re-checked at every turn. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
+Apart from the `CLAUDE.md` message and the */compact* lines each rewrite leaves, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are watched and re-checked at every turn. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
 
 ## Installing
 
