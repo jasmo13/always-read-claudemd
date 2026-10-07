@@ -1,4 +1,4 @@
-# always-read-claudemd
+# Always read claudemd
 
 A Claude Code plugin that pins your `CLAUDE.md` into the **system prompt**, so its rules are never lost when a conversation is compacted.
 
