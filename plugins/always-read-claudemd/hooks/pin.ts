@@ -26,26 +26,20 @@ export const TIERS: Record<string, string> = {
 
 const OVERRIDE = 'IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.'
 
-// The first line and paragraph of the CLAUDE.md message, which is how it is found again.
-export const HEADER = [
-  '# CLAUDE.md',
-  '',
-  "This is the CLAUDE.md file: the user's instructions, exactly as they are on disk now. This message is kept first in the conversation and rewritten whenever the files change, so where anything later in the conversation disagrees with it, this message is current. " +
-    OVERRIDE,
-].join('\n')
+// How versions before 0.9.0 began the CLAUDE.md message they put first in a chat at a compaction.
+// Older chats still hold one, and the chat never draws it.
+const OLD_HEADERS = [
+  "This is the CLAUDE.md file: the user's instructions, exactly as they were on disk when this conversation was last compacted.",
+  "This is the CLAUDE.md file: the user's instructions, exactly as they are on disk now. This message is kept first",
+].map(line => `# CLAUDE.md\n\n${line}`)
 
-// The CLAUDE.md message is a system reminder, in the tags Claude Code wraps its own in.
-const OPEN = '<system-reminder>'
-const CLOSE = '</system-reminder>'
-
-/** What a system reminder says inside its tags; null for text that isn't one. */
-function unwrap(text: string): string | null {
+/** Whether a message's text is the CLAUDE.md message a version before 0.9.0 put first in the chat. */
+export function isMessage(text: string): boolean {
   const trimmed = text.trim()
-  return trimmed.startsWith(OPEN) && trimmed.endsWith(CLOSE) ? trimmed.slice(OPEN.length, -CLOSE.length).trim() : null
+  if (!trimmed.startsWith('<system-reminder>') || !trimmed.endsWith('</system-reminder>')) return false
+  const body = trimmed.slice('<system-reminder>'.length).trim()
+  return OLD_HEADERS.some(header => body.startsWith(header))
 }
-
-/** Whether a message's text is the CLAUDE.md message. */
-export const isMessage = (text: string) => unwrap(text)?.startsWith(HEADER) === true
 
 export const keyOf = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
@@ -68,51 +62,72 @@ export function pathsOf(input: Record<string, unknown>): string[] {
 
 const SUBFOLDER = 'subfolder instructions; apply when working in '
 
-function section(file: PinnedFile): string {
-  const label = file.scope === undefined ? (LABELS[file.kind] ?? file.kind) : `${SUBFOLDER}${file.scope}`
-  return `Contents of ${file.path} (${label}):\n\n${file.content.trim()}`
+const labelOf = (file: PinnedFile) => (file.scope === undefined ? (LABELS[file.kind] ?? file.kind) : `${SUBFOLDER}${file.scope}`)
+
+const section = (file: PinnedFile) => `Contents of ${file.path} (${labelOf(file)}):\n\n${file.content.trim()}`
+
+/**
+ * The hidden block the plugin attaches to a message for Claude: each file in full, as it is on disk
+ * now, then a line for each removed one. Null when there is nothing to send.
+ */
+export function blockOf(files: PinnedFile[], removed: PinnedFile[] = []): string | null {
+  const shown = files.filter(f => f.content.trim() !== '')
+  if (shown.length === 0 && removed.length === 0) return null
+  const intro =
+    shown.length === 0
+      ? []
+      : [
+          "These are the user's CLAUDE.md instructions, exactly as they are on disk now. Their current text isn't in this conversation, so here it is: where anything earlier in the conversation differs, this is current. " +
+            OVERRIDE,
+        ]
+  const gone = removed.map(f => `Removed: ${f.path} (${labelOf(f)}). Its instructions no longer apply.`)
+  return ['# CLAUDE.md', ...intro, ...shown.map(section), ...gone].join('\n\n')
 }
 
-const SECTION = /^Contents of (.+) \(([^()]+)\):$/
+/** Everything pinned, as the hidden block would carry it all: what the line and the pane size. */
+export function pinnedText(pin: Pin): string {
+  const raw = pin.source === 'raw' ? (pin.raw ?? '').trim() : ''
+  const files = pin.source === 'raw' ? pin.files.filter(f => f.scope !== undefined) : pin.files
+  return [raw, blockOf(files) ?? ''].filter(t => t !== '').join('\n\n')
+}
 
-/** What a section's label says of its file: its tier, and its folder for a subfolder's file. */
-function labelled(path: string, label: string): Pick<PinnedFile, 'kind' | 'scope'> | null {
-  if (label.startsWith(SUBFOLDER)) {
-    return { kind: /CLAUDE\.local\.md$/i.test(path) ? 'local' : 'project', scope: label.slice(SUBFOLDER.length) }
+/** Text as it's compared: line endings as LF, and no space at either end. */
+const plain = (text: string) => text.replace(/\r\n?/g, '\n').trim()
+
+// Claude Code leaves HTML comments out of the copy of a CLAUDE.md it gives Claude.
+const withoutComments = (text: string) => plain(text.replace(/<!--[\s\S]*?-->/g, ''))
+
+/** Every text in a message's content, tool results and tool inputs included, thinking left out. */
+function textsOf(content: unknown, into: string[]) {
+  if (typeof content === 'string') into.push(content)
+  else if (Array.isArray(content)) for (const part of content) textsOf(part, into)
+  else if (content !== null && typeof content === 'object') {
+    const block = content as { type?: string; text?: unknown; content?: unknown; input?: unknown }
+    if (block.type === 'thinking' || block.type === 'redacted_thinking') return
+    if (typeof block.text === 'string') into.push(block.text)
+    if (block.content !== undefined) textsOf(block.content, into)
+    if (block.input !== null && typeof block.input === 'object') textsOf(Object.values(block.input), into)
   }
-  const kind = Object.keys(LABELS).find(k => LABELS[k] === label) ?? (/^[a-z]+$/.test(label) ? label : undefined)
-  return kind === undefined ? null : { kind }
 }
 
 /**
- * The files a CLAUDE.md message holds, read back from its text, so a resumed chat knows what Claude
- * holds; null when the text is not one. Their mtimes are unknown, so the next sync re-reads them.
+ * The conversation as Claude reads it (its Messages API form) as one text to look files up in,
+ * with `extra` texts Claude is about to be given. Read shows a file with a number before each
+ * line, so the text is kept a second time without them.
  */
-export function filesOf(text: string): PinnedFile[] | null {
-  const body = unwrap(text)
-  if (body === null || !body.startsWith(HEADER)) return null
-  const files: (PinnedFile & { lines: string[] })[] = []
-  for (const line of body.slice(HEADER.length).split('\n')) {
-    const [, path = '', label = ''] = SECTION.exec(line) ?? []
-    const tier = path === '' ? null : labelled(path, label)
-    if (tier !== null) files.push({ path, ...tier, content: '', mtimeMs: -1, lines: [] })
-    else files.at(-1)?.lines.push(line)
-  }
-  return files.map(({ lines, ...file }) => ({ ...file, content: lines.join('\n').trim() }))
+export function contextOf(messages: readonly unknown[], extra: readonly string[] = []): string {
+  const texts = [...extra]
+  for (const message of messages) textsOf((message as { content?: unknown }).content, texts)
+  const text = texts.join('\n\n').replace(/\r\n?/g, '\n')
+  return `${text}\n\n${text.replace(/^ *\d+(?:\t|→)/gm, '')}`
 }
 
-/** The pin as the model reads it, part by part: the text another plugin rewrote, then each file's section. */
-function partsOf(pin: Pin): string[] {
-  const nested = pin.files.filter(f => f.scope !== undefined)
-  const shown = pin.source === 'raw' ? nested : pin.files
-  const raw = (pin.raw ?? '').trim()
-  return [...(pin.source === 'raw' && raw !== '' ? [raw] : []), ...shown.filter(f => f.content.trim() !== '').map(section)]
-}
-
-/** The CLAUDE.md message the model reads, as a system reminder, or null when there is nothing to pin. */
-export function render(pin: Pin): string | null {
-  const parts = partsOf(pin)
-  return parts.length === 0 ? null : `${OPEN}\n${HEADER}\n\n${parts.join('\n\n')}\n${CLOSE}`
+/** Whether the conversation holds a file's whole text as it is now; an empty file needs nothing. */
+export function isHeld(content: string, context: string): boolean {
+  const text = plain(content)
+  if (text === '') return true
+  const bare = withoutComments(content)
+  return context.includes(text) || (bare !== '' && context.includes(bare))
 }
 
 /** How many files the pin carries, as the band and status line count them. */

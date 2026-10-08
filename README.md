@@ -1,54 +1,81 @@
 # Always read claudemd
 
-A Claude Code plugin that keeps your `CLAUDE.md` as the **first message** of every chat, word for word, and rewrites that message whenever the files change, so its rules are never lost when a conversation is compacted.
+A Claude Code plugin that makes sure Claude has your `CLAUDE.md` as it is on disk now, word for word. When Claude doesn't have a file's current text, the plugin sends it as a **hidden part of your next message**. You don't see it in the chat, but Claude does, and it stays in that message, so Claude can refer back to it later.
+
+**It never compacts a chat, never rewrites a message already sent, and never touches the system prompt.**
 
 ## Why
 
-Claude Code puts your `CLAUDE.md` into the conversation's first message. When a long conversation is compacted, that message is replaced by a summary, and the rules can get paraphrased, weakened or lost. Claude then stops following them. A file edited mid-chat is only added further down, so the old text stays in the conversation too.
+Claude Code gives Claude your `CLAUDE.md` when a chat starts, and again after a compaction. Between those times it can fall out of date:
 
-This plugin keeps one message, first in the chat, that holds your `CLAUDE.md` files exactly as they are on disk. It never touches the system prompt.
+- **Edits made outside Claude Code aren't sent.** If you change a `CLAUDE.md` in your editor, in another chat or with git mid-chat, Claude keeps working from the old text.
+- **A compaction drops subfolder rules.** A `CLAUDE.md` in a subfolder Claude was working in only comes back when Claude opens a file there again, so until then Claude works without it.
+- **You can't see which rules Claude is working under**, or how many tokens they cost.
 
 ## What it does
 
-The message is a system reminder, wrapped in the same `<system-reminder>` tags Claude Code puts around its own. It starts with *# CLAUDE.md*, says it's the user's instructions as they are on disk now, and then holds each file in full, headed by where it is and what it is.
+At each message you send, before it goes to Claude, the plugin reads the conversation exactly as Claude will read it, then checks each pinned file against it. That conversation includes Claude Code's own copies of your files, tool calls and their results, and the plugin's own earlier hidden blocks.
+
+- If a file's **whole current text** is already in the conversation, nothing is sent.
+- If it isn't, the file is sent in full with your message, with a toast: *CLAUDE.md sent to Claude: ~/app/CLAUDE.md*.
+
+Only text that is actually in the conversation counts:
+
+- **Claude's own Write** of the whole file counts, because the file's whole text is in the call.
+- **An Edit doesn't count.** It shows Claude only a snippet, so after an Edit the whole file goes with your next message.
+- **A Read counts** only when it shows the whole file. The line numbers Read adds are ignored, and a partial Read doesn't count.
+- HTML comments, which Claude Code leaves out of its own copy, may be missing from the conversation's copy.
 
 | When | What happens |
 | --- | --- |
-| A chat starts | The plugin puts the `CLAUDE.md` message first. It holds every file Claude Code loaded: managed, user `~/.claude/CLAUDE.md`, project, `CLAUDE.local.md`, rules, auto-memory and `@imports`. From then on, Claude Code's own copy is left out of what Claude reads, so nothing is there twice. |
-| A chat is resumed | If the files are unchanged, nothing happens. If they changed while it was closed, the message is rewritten before Claude reads anything. Subfolder files the message held stay pinned. |
-| A pinned `CLAUDE.md` is edited, created or deleted between turns | The message is rewritten at once, in every open chat, with a toast: *CLAUDE.md changed: re-pinned*. A file created where there was none is in it within a second. The old text is gone from the chat, not just superseded. |
-| A file changes while Claude is working, or Claude edits it | The message is rewritten as soon as the turn ends, before your next message. |
-| Compaction (`/compact` or auto) | Claude Code summarizes the chat as usual. The `CLAUDE.md` message is then put back first, whole, never summarized. |
-| `/clear` | The chat is emptied, and the `CLAUDE.md` message is put back. |
-| You rewind (`/rewind`, or Esc twice) | The chat goes back to how it was, with the `CLAUDE.md` message it had then. If the files have changed since, the message is rewritten from disk at once, before your next message. Restoring code as well puts back any `CLAUDE.md` Claude edited, and the message it had then matches it. |
-| No `CLAUDE.md` anywhere | It adds no message and no tokens. Its line reads *No CLAUDE.md found*. |
-| Claude opens a file in a subfolder with its own `CLAUDE.md` | That subfolder's file is added to the message when the turn ends, marked *apply when working in &lt;folder&gt;*, with a toast: *CLAUDE.md pinned: ~/app/api/CLAUDE.md*. |
-| 10 of your messages pass with no work in that subfolder | It's taken out of the message, with a toast: *CLAUDE.md unpinned: ~/app/api/CLAUDE.md*. Opening a file there again pins it again. |
+| A chat starts, is resumed, or after `/clear` | Nothing extra. Claude Code gives Claude its `CLAUDE.md` with that message, so the plugin sends nothing. It notes which files Claude Code loaded: managed, user `~/.claude/CLAUDE.md`, project, `CLAUDE.local.md`, rules, auto-memory and `@imports`. |
+| A `CLAUDE.md` is edited outside Claude Code | With your next message, the new text is sent, with a toast: *CLAUDE.md changed*. Opening the pane shows it sooner. |
+| Claude edits a `CLAUDE.md` | A Write needs nothing more. After an Edit, the whole file is sent with your next message. |
+| You send messages while Claude is working | Each is checked the same way. When several reach Claude together, the block goes with the first only. |
+| A compaction (`/compact`, or Claude Code's own when the chat is full) | Claude Code gives Claude its startup files again, so they aren't sent twice. Any pinned subfolder file it dropped is sent with your next message. |
+| A new `CLAUDE.md` appears | It's pinned and sent with your next message. |
+| A pinned `CLAUDE.md` is deleted | If Claude had its text, your next message says it was removed and no longer applies. |
+| Claude opens a file in a subfolder with its own `CLAUDE.md` | That file is pinned, with a toast: *CLAUDE.md pinned: ~/app/api/CLAUDE.md*. Claude Code gives Claude a copy itself; the plugin sends it only if that copy is missing or out of date. |
+| 10 of your messages pass with no work in that subfolder | It's unpinned, with a toast: *CLAUDE.md unpinned: ~/app/api/CLAUDE.md*. Opening a file there again pins it again. |
+| No `CLAUDE.md` anywhere | Nothing is sent. Its line reads *No CLAUDE.md found*. |
 | A subagent runs | It reads `CLAUDE.md` the way Claude Code gives it to subagents, unchanged. |
+
+### The hidden block
+
+The block goes with your message as context added by a hook, the same way Claude Code adds its own reminders. Claude reads it as part of that message, wrapped in `<system-reminder>` tags. It isn't drawn in the chat in the terminal or the desktop app. It's saved with the message, so it's still there on later turns and when you resume the chat, and Claude can refer back to it. It looks like this:
+
+```
+# CLAUDE.md
+
+These are the user's CLAUDE.md instructions, exactly as they are on disk now. Their current text isn't in this conversation, so here it is: where anything earlier in the conversation differs, this is current. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.
+
+Contents of C:\Users\you\app\CLAUDE.md (project instructions, checked into the codebase):
+
+Use spaces.
+Run the tests first.
+
+Contents of C:\Users\you\app\api\CLAUDE.md (subfolder instructions; apply when working in C:\Users\you\app\api):
+
+Validate every endpoint.
+
+Removed: C:\Users\you\app\CLAUDE.local.md (user's private project instructions, not checked in). Its instructions no longer apply.
+```
+
+Only the files Claude lacks are in it. Once a file's text has been sent, it's in the conversation, so it isn't sent again until the file changes.
+
+Chats from versions before 0.9.0 may hold the `CLAUDE.md` message those versions put first. It's still never drawn in the chat, and Claude still counts its text.
 
 ### Where it looks for files
 
 - **At startup:** whatever Claude Code itself loads. That's `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md`), plus `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working directory and every folder above it, and files such as `.claude/rules/*.md`. All of them are pinned, top-level folder first.
-- **Whenever it checks:** the same user-level and parent-folder locations, so a file created there mid-chat is picked up.
-- **Symlinks:** a `CLAUDE.md` that is a symbolic link, say to an `AGENTS.md`, is read through the link and watched where it points, so editing `AGENTS.md` re-pins it like editing the `CLAUDE.md` itself.
+- **At each of your messages:** every pinned file is read again, and the user-level and parent-folder locations are checked for new files. This is the only check that decides what Claude is sent. There's no timer and no file watching: while you're idle, nothing runs.
+- **When you open the pane, press a file in it, or go back to the list:** the files are read from disk right then, so the pane shows them as they are now. The line under the prompt shows what was read last, at your last message or the last time you looked in the pane.
+- **Symlinks:** a `CLAUDE.md` that is a symbolic link, say to an `AGENTS.md`, is read through the link, so editing `AGENTS.md` counts as editing the `CLAUDE.md` itself.
 - **Subfolders:** a subfolder's `CLAUDE.md` is pinned once Claude opens a file in that folder (Read, Edit, Write, MultiEdit or NotebookEdit). Only folders Claude actually works in are pinned, so the rest of the repo costs nothing.
 
 ### Subfolder files
 
-A subfolder's file stays pinned while Claude keeps working in that folder. Any tool call with a path inside it counts, searches included, and resets the count. After 10 of your messages with no work there, the file is unpinned. It also survives compaction and `/clear`, like the startup files.
-
-Claude Code also adds the subfolder's file by itself when Claude first opens a file there. Claude reads that copy for the rest of the turn; once the `CLAUDE.md` message holds the file, Claude Code's copy is left out.
-
-## How the message is rewritten
-
-Claude Code has no way for a plugin to edit a message in place. What it does let a plugin do is answer a compaction. So when the files change, the plugin runs a compaction and answers it itself: nothing is summarized. The chat comes back exactly as it was, with the old `CLAUDE.md` message taken out and the new one put first.
-
-- **The message itself isn't drawn in the chat.** The line and the pane show what's pinned, and a toast says when it changes.
-- **Each rewrite shows in the chat** as */compact* and *Compacted* lines. That's the plugin's rewrite, not a summary. Claude Code draws those lines itself and doesn't let a plugin hide them.
-- **It never happens partway through a turn.** It happens when a chat starts or resumes, when a turn ends, after a rewind, or at once when a file changes while Claude is idle.
-- **The terminal and the desktop app work the same way.** The desktop app also brings the message up to date when it opens a chat that changed while it was in the background.
-- **In `claude -p` and SDK apps that don't show the chat,** it only happens as a run starts. These runs print the last result they have, and a rewrite after the answer would replace it. A file changed during a run is in the message at the start of the next one. A subfolder file pinned during a `-p` run isn't carried into the next run.
-- **After a real `/compact`,** Claude Code's summary may still mention what older versions of the files said, as history. The `CLAUDE.md` message above it is the current text, and it says so.
+A subfolder's file stays pinned while Claude keeps working in that folder. Any tool call with a path inside it counts, searches included, and resets the count. After 10 of your messages with no work there, the file is unpinned.
 
 ## The line and the pane
 
@@ -78,7 +105,7 @@ If other plugins also draw bands above the prompt, they're all shown. This one c
 ```
 ● 2 files pinned  ~376 tokens                  h: Hide band
 ───────────────────────────────────────────────────────────
-Kept in sync with disk. Press a file to read it.
+As on disk now. Press a file to read it.
 
 Loaded at startup
 1: ~/app/CLAUDE.md                                     ~114
@@ -89,7 +116,7 @@ Subfolders
    Unpins after 10 more messages without work here
 
 Last change
-Pinned ~/app/api/CLAUDE.md                     this message
+Sent to Claude: ~/app/api/CLAUDE.md            this message
 ```
 
 In the terminal, the button reads **Hide status line**. Everything above the rule stays put and everything under it scrolls with the mouse wheel or the page keys, so a long file never pushes that button out of sight. A scroll bar on the right shows where you are, whenever there's more than fits. The desktop app scrolls the pane itself, with its own scroll bar, so there the whole pane scrolls, top included. So that you always know which file is open, the pane's tab title names it, where it comes from and its size, such as *~/app/CLAUDE.md: This project, shared with the team (~1.7k tokens, read-only)*. Both leave a margin between the text and the pane's edges.
@@ -98,13 +125,15 @@ The pane's frame and background come from Claude Code's theme. If the pane looks
 
 - **Loaded at startup** lists the files Claude Code loaded when the chat began, each with where it comes from: yours for every project, this project's shared file, your private one for this project, your organization's policy or auto memory.
 - **Subfolders** lists the subfolder files, each with how many more messages before it's unpinned.
-- **Last change** is what was last edited, added, removed, pinned or unpinned, and when.
+- **Last change** is what was last edited, added, removed, pinned, unpinned or sent to Claude, and when.
 
-Every file is named by where it is, with `~` for your home folder, so a project's file says which project it's in. Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, exactly as it's pinned now, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
+Every file is named by where it is, with `~` for your home folder, so a project's file says which project it's in. Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, as it is on disk now, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
 
 `/claudemd` opens the pane, on the list of files, or closes it when it's open. Pinning runs in the background either way.
 
-Apart from the `CLAUDE.md` message and the */compact* lines each rewrite leaves, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button, because the files are watched, and checked again every second and at every turn. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at once.
+Apart from the hidden block, the plugin never writes to the chat; everything it reports is a toast. There's no refresh button: opening the pane or a file in it reads the files from disk. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at their next message.
+
+The terminal, the desktop app and `claude -p` work the same way.
 
 ## Installing
 
@@ -148,8 +177,8 @@ The plugin lives in `plugins/always-read-claudemd/`; the repository root holds t
 
 | Path | Contents |
 | --- | --- |
-| `hooks/register.tsx` | Hooks: capturing the files Claude Code loaded, keeping the `CLAUDE.md` message first and rewriting it, leaving out Claude Code's own copies, re-syncing from disk, subfolder pins, the band and the pane |
-| `hooks/pin.ts` | Pure helpers: the `CLAUDE.md` message and reading it back, paths, token estimates |
+| `hooks/register.tsx` | Hooks: capturing the files Claude Code loaded, checking the conversation at each message and attaching the hidden block, re-syncing from disk, subfolder pins, the band and the pane |
+| `hooks/pin.ts` | Pure helpers: the hidden block, finding a file's text in the conversation, paths, token estimates |
 | `tests/register.test.ts` | Tests |
 | `types/index.d.ts` | Types for the values the plugin keeps between reloads |
 | `.claude-plugin/plugin.json` | The plugin's manifest and version |
@@ -172,7 +201,7 @@ claude plugin validate .
 
 In the same pull request:
 
-- Update this README whenever a change adds a feature or changes what the plugin pins, what the band and pane show, or how it behaves.
+- Update this README whenever a change adds a feature or changes what the plugin pins, what it sends Claude, what the band and pane show, or how it behaves.
 - To release, bump `version` in `plugins/always-read-claudemd/.claude-plugin/plugin.json`.
 
 ## License
