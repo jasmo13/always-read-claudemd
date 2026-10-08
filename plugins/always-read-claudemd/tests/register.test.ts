@@ -1,8 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { InstructionFile, On, RenderElement, PromptContextInput, RenderSurface, SessionMessage, UiPane } from 'claude-code'
+import type { InstructionFile, On, RenderElement, PromptContextInput, SessionMessage, UiPane } from 'claude-code'
 
-import { HEADER, bandLayout, displayPath, filesOf, isBlank, isMessage, render, scrollBar, scrolled, tabTitle } from '../hooks/pin'
+import { bandLayout, blockOf, contextOf, displayPath, isBlank, isHeld, isMessage, scrollBar, scrolled, tabTitle } from '../hooks/pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'
@@ -11,10 +11,12 @@ const LOCAL_MD = `${PROJECT}/CLAUDE.local.md`
 const USER_MD = `${HOME}/.claude/CLAUDE.md`
 const API_MD = `${PROJECT}/api/CLAUDE.md`
 const API_FILE = `${PROJECT}/api/orders.ts`
-// The plugin's file in Claude Code's store, which every chat watches.
-const STORE_FILE = `${HOME}/.claude/plugins/store/always-read-claudemd_inline-abc123.json`
-// Another plugin's file there, which Claude Code also tells this plugin about.
-const OTHER_STORE_FILE = `${HOME}/.claude/plugins/store/usage-mod_inline-def456.json`
+// How versions before 0.8.0 began the message, as older chats still hold it.
+const OLD_HEADER = [
+  '# CLAUDE.md',
+  '',
+  "This is the CLAUDE.md file: the user's instructions, exactly as they are on disk now. This message is kept first in the conversation and rewritten whenever the files change, so where anything later in the conversation disagrees with it, this message is current. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.",
+].join('\n')
 
 const COMPOSE = {
   model: 'claude-opus-5-5',
@@ -33,7 +35,7 @@ const keyOf = (path: string) => path.replace(/\\/g, '/').toLowerCase()
 
 /**
  * A fake file system, the session's environment and clock beneath the plugin. `links` maps a
- * symbolic link to the file it points at, as `$.fs.stat` resolves it.
+ * symbolic link to the file it points at: like `$.fs.stat` and `$.fs.read`, the fake reads through it.
  */
 function world(on: On, files: Record<string, string>, now: number, links: Record<string, string> = {}) {
   const disk = new Map<string, { path: string; content: string; mtimeMs: number }>()
@@ -43,19 +45,17 @@ function world(on: On, files: Record<string, string>, now: number, links: Record
   }
   const remove = (path: string) => disk.delete(keyOf(path))
   for (const [path, content] of Object.entries(files)) write(path, content)
+  const linkOf = (path: string) => Object.entries(links).find(([from]) => keyOf(from) === keyOf(path))?.[1]
+  const fileAt = (path: string) => disk.get(keyOf(linkOf(path) ?? path))
 
   const missing = (path: string) => Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' })
   on('fs.stat', (_$, e) => {
-    const file = disk.get(keyOf(e.path))
+    const file = fileAt(e.path)
     if (file === undefined) throw missing(e.path)
-    const link = Object.entries(links).find(([from]) => keyOf(from) === keyOf(e.path))?.[1]
-    const resolved = e.resolve ? { realPath: link ?? e.path } : {}
-    return {
-      value: { kind: 'file', size: file.content.length, mtimeMs: file.mtimeMs, isLink: link !== undefined, ...resolved },
-    } as never
+    return { value: { kind: 'file', size: file.content.length, mtimeMs: file.mtimeMs, isLink: linkOf(e.path) !== undefined } } as never
   })
   on('fs.read', (_$, e) => {
-    const file = disk.get(keyOf(e.path))
+    const file = fileAt(e.path)
     if (file === undefined) throw missing(e.path)
     return { value: file.content } as never
   })
@@ -82,22 +82,13 @@ function world(on: On, files: Record<string, string>, now: number, links: Record
     )
     return { value: found } as never
   })
-  on('fs.list', (_$, e) => {
-    const dir = `${keyOf(e.path)}/`
-    const names = [...disk.values()].flatMap(f => {
-      const rest = keyOf(f.path).startsWith(dir) ? f.path.slice(dir.length) : ''
-      return rest === '' || rest.includes('/') ? [] : [{ name: rest, kind: 'file' }]
-    })
-    return { value: names } as never
-  })
   on('session.root', () => ({ value: PROJECT }) as never)
   mock.env(on, { USERPROFILE: HOME })
-  // The plugin's store, shared by every chat: a write lands in its file on disk.
+  // The plugin's store, shared by every chat.
   const stored = new Map<string, unknown>()
   on('store.get', (_$, e) => ({ value: stored.get(e.key) }) as never)
   on('store.set', (_$, e) => {
     stored.set(e.key, e.value)
-    write(STORE_FILE, JSON.stringify(Object.fromEntries(stored)))
     return { value: undefined } as never
   })
   // What the engine draws where the plugin draws nothing: an empty box.
@@ -144,56 +135,58 @@ function engine(on: On, files: InstructionFile[] | null, options: { rewrittenAs?
   }
 }
 
-const isOwn = (m: SessionMessage) => m.role === 'user' && isMessage(m.text)
+/** How Claude Code puts a block a prompt.submit hook attached into the message Claude reads. */
+const hidden = (block: string) => `<system-reminder>\nprompt.submit hook additional context: ${block}\n</system-reminder>`
 
 /**
- * The chat beneath the plugin: its messages, as `$.session.messages()` reads them, and Claude
- * Code's /compact, which runs `session.compact` over them and keeps what it answers. Beneath the
- * plugin's hook the summarizer answers with a summary and the last message. Turns, attachments
- * and the classic hooks pass through.
+ * The chat beneath the plugin, as Claude reads it (`$.session.messages({ as: 'api' })`): each
+ * message sent lands in it with the blocks hooks attached, and Claude Code's /compact replaces it
+ * with a summary. `swaps` counts every /compact anyone ran: the plugin must never run one.
  */
-function conversation($: Engine, on: On, messages: SessionMessage[] = [MESSAGE, REPLY]) {
-  const chat = { messages, prompts: 1, swaps: 0, summaries: 0, surfaces: ['terminal'] as RenderSurface[] }
-  on('session.messages', () => ({ value: [...chat.messages] }) as never)
-  on('session.turns', () => ({ value: chat.prompts }) as never)
-  on('session.surfaces', () => ({ value: [...chat.surfaces] }) as never)
-  on('command.run', { command: 'compact' }, async (_$, e) => {
-    const done = await $.session.compact({ trigger: 'manual', messages: chat.messages, instructions: e.args })
-    if (done.messages !== undefined) chat.messages = [...done.messages]
+function conversation($: Engine, on: On, history: unknown[] = []) {
+  const chat = { api: [...history], blocks: [] as (string | undefined)[], swaps: 0 }
+  on('session.messages', (_$, e) => ({ value: e.as === 'api' ? [...chat.api] : [MESSAGE, REPLY] }) as never)
+  on('prompt.submit', (_$, e) => {
+    const context = e.context ?? []
+    chat.api.push({ role: 'user', content: [{ type: 'text', text: e.text }, ...context.map(c => ({ type: 'text', text: hidden(c) }))] })
+    chat.blocks.push(context.length === 0 ? undefined : context.join('\n'))
+    return { text: e.text, ...(e.context === undefined ? {} : { context: e.context }) }
+  })
+  on('command.run', { command: 'compact' }, () => {
     chat.swaps += 1
     return {}
   })
-  on('session.compact', (_$, e) => {
-    chat.summaries += 1
-    return { messages: [{ role: 'user', text: `Summary of the chat (${e.instructions ?? ''}).`, toolUses: [] }, ...e.messages.slice(-1)] }
-  })
+  // Beneath the plugin, the summarizer answers with a summary and the last message.
+  on('session.compact', (_$, e) => ({ messages: [{ role: 'user', text: 'Summary of the chat.', toolUses: [] }, ...e.messages.slice(-1)] }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.attach', (_$, e) => ({ clientId: e.clientId }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
-  on('prompt.attachment', (_$, e) => ({ text: e.text }))
-  on('classic.SessionStart', () => ({}))
-  on('classic.FileChanged', () => ({}))
-  on('ui.invalidate', () => ({ value: undefined }) as never)
 
   let turns = 0
   return {
     chat,
-    /** The CLAUDE.md message's text when it is first in the chat. */
-    first: () => {
-      const [head] = chat.messages
-      return head !== undefined && isOwn(head) ? head.text : undefined
+    /** You send a message: the hidden block the plugin attached to it, if any. */
+    send: async (text = 'next') => {
+      await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+      return chat.blocks.at(-1)
+    },
+    /** Claude Code adds text to the conversation itself: its CLAUDE.md copy, a tool's result. */
+    add: (text: string, role: 'user' | 'assistant' = 'user') => chat.api.push({ role, content: [{ type: 'text', text }] }),
+    /** Claude calls a tool, and the result it reads. */
+    tool: (name: string, input: Record<string, unknown>, result: string) => {
+      chat.api.push({ role: 'assistant', content: [{ type: 'tool_use', id: `t${chat.api.length}`, name, input }] })
+      chat.api.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${chat.api.length - 1}`, content: result }] })
+    },
+    /** A compaction: Claude Code replaces the conversation with a summary, then reads its files again. */
+    compact: async (input: PromptContextInput) => {
+      chat.api = [{ role: 'user', content: 'Summary of the chat.' }]
+      await $.prompt.context(input)
     },
     /** A chat opens: in the terminal, or with nothing drawing it (the desktop app before it attaches, -p). */
-    start: (isInteractive = true) => {
-      chat.surfaces = isInteractive ? ['terminal'] : []
-      return $.session.start({ cwd: PROJECT, surface: isInteractive ? 'terminal' : null, isInteractive })
-    },
+    start: (isInteractive = true) => $.session.start({ cwd: PROJECT, surface: isInteractive ? 'terminal' : null, isInteractive }),
     /** The desktop app opens the chat. */
-    attach: () => {
-      chat.surfaces = ['desktop']
-      return $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
-    },
+    attach: () => $.session.attach({ surface: 'desktop', clientId: 'desktop:default' }),
     /** A turn of the main chat: its work, then its end. */
     turn: async (work: () => Promise<unknown> = async () => undefined) => {
       const turnId = `turn-${(turns += 1)}`
@@ -201,12 +194,6 @@ function conversation($: Engine, on: On, messages: SessionMessage[] = [MESSAGE, 
       await work()
       return $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId, reason: 'answer' } as never)
     },
-    sessionStart: (source: 'startup' | 'resume' | 'clear' | 'compact' | 'fork', transcript = '') =>
-      $.classic.SessionStart({ session_id: 's1', transcript_path: transcript, cwd: PROJECT, hook_event_name: 'SessionStart', source } as never),
-    changed: (path: string) =>
-      $.classic.FileChanged({ session_id: 's1', transcript_path: '', cwd: PROJECT, hook_event_name: 'FileChanged', file_path: path, event: 'change' } as never),
-    attachment: (type: string, text: string, agentId?: string) =>
-      $.prompt.attachment({ type, text, origin: { kind: 'engine' }, ...(agentId === undefined ? {} : { agentId }) } as never),
   }
 }
 
@@ -233,444 +220,335 @@ const PANE = {
 /** Claude Code beneath a tool call: the tool ran. */
 function tools(on: On) {
   on('tool.call', () => ({ result: 'ok' }) as never)
-  on('prompt.submit', (_$, e) => ({ text: e.text, ...(e.context === undefined ? {} : { context: e.context }) }))
 }
 
-test('a new chat gets CLAUDE.md as its first message; the system prompt and context are left alone', async ($, on) => {
+/** The files the pane lists as pinned, by where they are. */
+async function pinned($: Engine): Promise<string[]> {
+  const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
+  // Each file is a button that opens it.
+  const buttons = await pane.findAll({ type: 'Button' })
+  await pane.unmount()
+  return buttons.map(b => b.text ?? '').filter(t => t.endsWith('.md'))
+}
+
+const PROJECT_LABEL = 'project instructions, checked into the codebase'
+const copyOf = (path: string, label: string, text: string) => `Contents of ${path} (${label}):\n\n${text}`
+
+test('a new chat: Claude Code gives Claude its CLAUDE.md, and the plugin adds nothing', async ($, on) => {
   world(on, { [PROJECT_MD]: 'Always use tabs.' }, 1_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Always use tabs.' }])
-  const { chat, first, start } = conversation($, on)
+  const { chat, send, add, start } = conversation($, on)
 
   const context = await $.prompt.context(input)
   expect(context.blocks.map(b => b.name)).toEqual(['claudeMd', 'currentDate'])
   await start()
-
-  // A system reminder, in the tags Claude Code wraps its own in.
-  const text = first() ?? ''
-  expect(text.startsWith(`<system-reminder>\n${HEADER}\n\n`)).toBe(true)
-  expect(text.endsWith('\n</system-reminder>')).toBe(true)
-  expect(text).toContain(`Contents of ${PROJECT_MD} (project instructions, checked into the codebase):\n\nAlways use tabs.`)
-  // Put first by a compaction the plugin answers itself: nothing is summarized, the chat is kept.
-  expect(chat.swaps).toBe(1)
-  expect(chat.summaries).toBe(0)
-  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
+  // Claude Code adds its copy to the first message after the plugin's hooks run: it isn't sent twice.
+  expect(await send('hello')).toBeUndefined()
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Always use tabs.'))
+  expect(await send()).toBeUndefined()
+  expect(chat.swaps).toBe(0)
   // The system prompt is Claude Code's own.
   expect((await $.prompt.compose(COMPOSE)).sections.map(s => s.id)).toEqual(['intro'])
 })
 
-test('pins what is on disk when Claude Code has not said which files it read', async ($, on) => {
-  world(on, { [PROJECT_MD]: 'Never commit to main.', [USER_MD]: 'Answer briefly.' }, 2_000_000)
-  engine(on, null)
-  const { first, start } = conversation($, on)
+test('the plugin never compacts a chat, and leaves compaction to Claude Code', async ($, on) => {
+  const { clock, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 2_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, start, attach, turn } = conversation($, on)
+  tools(on)
+  await $.prompt.context(input)
 
+  // A chat starts, and is resumed.
   await start()
-  expect(first()).toContain('Never commit to main.')
-  expect(first()).toContain('Answer briefly.')
+  await $.prompt.context(input)
+  await start()
+  // A CLAUDE.md is edited while Claude is idle, then during a turn, and a subfolder's is pinned.
+  write(PROJECT_MD, 'Use spaces.')
+  await turn(async () => {
+    write(PROJECT_MD, 'Use both.')
+    await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
+  })
+  // Messages are sent, a file is created, time passes, the desktop app opens the chat.
+  for (let i = 0; i < 12; i++) await send()
+  write(USER_MD, 'Answer briefly.')
+  await clock.advance(60_000)
+  await attach()
+  const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'desktop', ...BAND })
+  await band.unmount()
+  // /clear, a run with nothing drawing it, and a file deleted.
+  await $.prompt.context(input)
+  await start(false)
+  remove(PROJECT_MD)
+  await send()
+  expect(chat.swaps).toBe(0)
+
+  // Claude Code's own compactions are its own: what it answers is kept as it is.
+  const messages = [MESSAGE, REPLY]
+  for (const trigger of ['manual', 'auto'] as const) {
+    const done = await $.session.compact({ trigger, messages })
+    expect(done.messages).toEqual([{ role: 'user', text: 'Summary of the chat.', toolUses: [] }, REPLY])
+  }
 })
 
-test('with no CLAUDE.md anywhere it adds no message', async ($, on) => {
-  world(on, {}, 3_000_000)
+test('an edit made outside Claude Code is sent with the next message, in full, and stays in the chat', async ($, on) => {
+  const { clock, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 3_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, add, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+
+  // Nothing checks the disk while you're idle, however long: only sending a message does.
+  write(PROJECT_MD, 'Use spaces.\nRun the tests first.')
+  await clock.advance(60_000)
+  expect(toasts).not.toContain('CLAUDE.md changed')
+  const block = await send()
+  expect(toasts).toContain('CLAUDE.md changed')
+  expect(block?.startsWith('# CLAUDE.md\n\nThese are the user\'s CLAUDE.md instructions, exactly as they are on disk now.')).toBe(true)
+  expect(block).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.\nRun the tests first.'))
+  expect(toasts).toContain(`CLAUDE.md sent to Claude: ${PROJECT_MD}`)
+
+  // It's part of that message from then on, so Claude can go back to it, and it isn't sent again.
+  expect(await send()).toBeUndefined()
+  expect(await send()).toBeUndefined()
+  expect(JSON.stringify(chat.api)).toContain('prompt.submit hook additional context: # CLAUDE.md')
+  expect(chat.blocks.filter(b => b !== undefined)).toHaveLength(1)
+
+  // The pane says what was sent.
+  const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
+  expect(await pane.find({ text: `Sent to Claude: ${PROJECT_MD}` })).toBeDefined()
+  await pane.unmount()
+})
+
+test('messages typed while Claude works that join its turn together carry the block once', async ($, on) => {
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 3_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  chat.api.push({ role: 'user', content: copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.') })
+  write(PROJECT_MD, 'Use spaces.')
+
+  // Two messages typed over turn T1, both read by Claude at its next step: neither is in the
+  // conversation when the other is checked.
+  const typed = async (text: string) => {
+    await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' }, turnId: 'T1' } as never)
+    chat.api.pop()
+    return chat.blocks.at(-1)
+  }
+  expect(await typed('first')).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.'))
+  expect(await typed('second')).toBeUndefined()
+  // A message sent later, in its own turn, is checked against the conversation alone.
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.'))
+})
+
+test("Claude's own Write holds the whole file; an Edit, which shows Claude a snippet, doesn't", async ($, on) => {
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 3_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { send, add, tool, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+
+  const rules = 'Use spaces.\nRun the tests first.\nKeep commits small.'
+  write(PROJECT_MD, rules)
+  tool('Write', { file_path: PROJECT_MD, content: rules }, `File created successfully at: ${PROJECT_MD}`)
+  expect(await send()).toBeUndefined()
+
+  const edited = rules.replace('Use spaces.', 'Use both.')
+  write(PROJECT_MD, edited)
+  tool('Edit', { file_path: PROJECT_MD, old_string: 'Use spaces.', new_string: 'Use both.' }, `The file ${PROJECT_MD} has been updated. Here's a snippet:\n     1\tUse both.`)
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, edited))
+})
+
+test('a file Claude read in full counts, line numbers and all; part of one does not', async ($, on) => {
+  const rules = 'Use tabs.\nRun the tests first.'
+  world(on, { [PROJECT_MD]: rules }, 4_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: rules }])
+  const { chat, send, tool, start, compact } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+
+  // After a compaction Claude Code gives its files again, so nothing is sent; then a summary alone.
+  await compact(input)
+  expect(await send()).toBeUndefined()
+  chat.api = [{ role: 'user', content: 'Summary of the chat.' }]
+  tool('Read', { file_path: PROJECT_MD, limit: 1 }, '     1\tUse tabs.')
+  expect(await send()).toContain(rules)
+
+  chat.api = [{ role: 'user', content: 'Summary of the chat.' }]
+  tool('Read', { file_path: PROJECT_MD }, '     1\tUse tabs.\n     2\tRun the tests first.')
+  expect(await send()).toBeUndefined()
+})
+
+test('a compaction drops a subfolder CLAUDE.md: the next message brings it back', async ($, on) => {
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 4_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, add, start, turn, compact } = conversation($, on)
+  tools(on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+
+  // Claude opens a file in api/: the folder's CLAUDE.md is pinned, and Claude Code gives Claude a copy.
+  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
+  expect(toasts.some(t => t.startsWith('CLAUDE.md pinned:'))).toBe(true)
+  add(`Contents of ${API_MD}:\n\nValidate every endpoint.`)
+  expect(await send()).toBeUndefined()
+
+  // A compaction: Claude Code gives the startup files again, not the subfolder's.
+  await compact(input)
+  const block = await send()
+  // The fake disk names folders in lower case.
+  expect(block).toContain(copyOf(API_MD, `subfolder instructions; apply when working in ${keyOf(PROJECT)}/api`, 'Validate every endpoint.'))
+  expect(block).not.toContain('Use tabs.')
+  // Claude Code adds its own copy of the startup files to that message, after the plugin's hooks.
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  expect(await send()).toBeUndefined()
+})
+
+test('a new CLAUDE.md is sent; a deleted one Claude still has is reported removed, once', async ($, on) => {
+  const { write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_000_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { send, add, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+
+  // Created where nothing was watched: found when the message is sent.
+  write(LOCAL_MD, 'My local rule.')
+  expect(await send()).toContain(copyOf(LOCAL_MD, "user's private project instructions, not checked in", 'My local rule.'))
+
+  remove(LOCAL_MD)
+  const block = await send()
+  expect(block).toBe(`# CLAUDE.md\n\nRemoved: ${LOCAL_MD} (user's private project instructions, not checked in). Its instructions no longer apply.`)
+  expect(await send()).toBeUndefined()
+})
+
+test('with no CLAUDE.md anywhere nothing is sent', async ($, on) => {
+  world(on, {}, 5_500_000)
   engine(on, null)
-  const { chat, first, start } = conversation($, on)
+  const { send, start } = conversation($, on)
 
   await start()
-  expect(first()).toBeUndefined()
-  expect(chat.swaps).toBe(0)
+  expect(await send('hello')).toBeUndefined()
   const hint = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...HINT })
   expect(await hint.find({ text: 'No CLAUDE.md found' })).toBeDefined()
   await hint.unmount()
 })
 
-test('between turns an edit rewrites the message at once; during a turn, when the turn ends', async ($, on) => {
-  const { clock, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, turn, changed } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-
-  write(PROJECT_MD, 'Use two spaces.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(chat.swaps).toBe(2)
-  expect(first()).toContain('Use two spaces.')
-  expect(first()).not.toContain('Use tabs.')
-  expect(toasts).toContain('CLAUDE.md changed: re-pinned')
-
-  await turn(async () => {
-    write(PROJECT_MD, 'Use four spaces.')
-    await changed(PROJECT_MD)
-    await clock.advance(10)
-    // Never mid-turn: the turn's requests keep the message they started with.
-    expect(chat.swaps).toBe(2)
-  })
-  expect(chat.swaps).toBe(3)
-  expect(first()).toContain('Use four spaces.')
-  // One CLAUDE.md message, the rest of the chat as it was, and nothing summarized.
-  expect(chat.messages.filter(isOwn).length).toBe(1)
-  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
-  expect(chat.summaries).toBe(0)
-
-  // A turn with nothing changed leaves the chat alone.
-  await turn()
-  expect(chat.swaps).toBe(3)
-
-  // Claude Code re-reads its context after a compaction, and its copy can be older than the disk
-  // (the engine here still gives 'Use tabs.'): the message keeps what is on disk.
-  await $.prompt.context(input)
-  await turn()
-  expect(chat.swaps).toBe(3)
-  expect(first()).toContain('Use four spaces.')
-})
-
-test('a rewind brings back the message the chat had then; it is rewritten from disk before the next prompt', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_200_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, changed } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-  const before = [...chat.messages]
-  // Claude Code draws the slot above the prompt whenever the chat changes.
-  const redraw = async () => {
-    const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...BAND })
-    await clock.advance(10)
-    await band.unmount()
-  }
-  chat.prompts = 3
-  await redraw()
-
-  write(PROJECT_MD, 'Use two spaces.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  chat.prompts = 5
-  await redraw()
-  expect(chat.swaps).toBe(2)
-
-  // Rewound to before that rewrite: the chat holds the old message, and fewer prompts.
-  chat.messages = before
-  chat.prompts = 3
-  await redraw()
-  expect(chat.swaps).toBe(3)
-  expect(first()).toContain('Use two spaces.')
-  expect(chat.messages.filter(isOwn).length).toBe(1)
-  expect(chat.messages.slice(1)).toEqual([MESSAGE, REPLY])
-
-  // A rewind to a point whose message is current leaves the chat alone.
-  chat.prompts = 2
-  await redraw()
-  expect(chat.swaps).toBe(3)
-})
-
-test("another plugin's store file is left alone; the files are checked once a second", async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_300_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, changed } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-
-  // A CLAUDE.md created where there was none: nothing watched it, so no event says so.
-  write(USER_MD, 'Answer briefly.')
-  // Another plugin saved its own file: not a CLAUDE.md change.
-  await changed(OTHER_STORE_FILE)
-  await clock.advance(10)
-  expect(chat.swaps).toBe(1)
-
-  // Within a second, it's in the message.
-  await clock.advance(1000)
-  expect(chat.swaps).toBe(2)
-  expect(first()).toContain('Answer briefly.')
-
-  // With nothing changed, the checks leave the chat alone.
-  await clock.advance(5000)
-  expect(chat.swaps).toBe(2)
-})
-
-test('a new file and a deleted file rewrite the message too', async ($, on) => {
-  const { write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 4_500_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, turn } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-
-  write(LOCAL_MD, 'My local rule.')
-  await turn()
-  expect(first()).toContain('Use tabs.')
-  expect(first()).toContain("My local rule.")
-
-  remove(PROJECT_MD)
-  remove(LOCAL_MD)
-  await turn()
-  expect(first()).toBeUndefined()
-  expect(chat.messages.some(isOwn)).toBe(false)
-})
-
-test("Claude Code's own copies are left out once the chat has the message; a subagent keeps them", async ($, on) => {
-  world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 5_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { start, turn, attachment } = conversation($, on)
-  tools(on)
-  await $.prompt.context(input)
-  const ENGINE_COPY = `Contents of ${PROJECT_MD} (project instructions, checked into the codebase):\n\nUse tabs.`
-  const NESTED_COPY = `Contents of ${API_MD}:\n\nValidate every endpoint.`
-
-  // Before the message is in the chat, Claude Code's copy is all Claude has.
-  expect((await attachment('instructions', ENGINE_COPY)).text).toBe(ENGINE_COPY)
-  await start()
-  expect((await attachment('instructions', ENGINE_COPY)).text).toBeNull()
-  expect((await attachment('instructions', ENGINE_COPY, 'agent-1')).text).toBe(ENGINE_COPY)
-  // A subfolder's copy stays until the message holds that file.
-  expect((await attachment('nested_memory', NESTED_COPY)).text).toBe(NESTED_COPY)
-  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
-  expect((await attachment('nested_memory', NESTED_COPY)).text).toBeNull()
-  // Other attachments pass through.
-  expect((await attachment('todo_reminder', 'Keep the list current.')).text).toBe('Keep the list current.')
-})
-
-test('a subfolder CLAUDE.md is pinned once Claude opens a file there, into the message when the turn ends', async ($, on) => {
-  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 8_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, turn } = conversation($, on)
-  tools(on)
-  await $.prompt.context(input)
-  await start()
-  expect(first()).not.toContain('Validate every endpoint.')
-
-  await turn(async () => {
-    await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
-    expect(first()).not.toContain('Validate every endpoint.')
-  })
-  // The fake disk names folders in lower case.
-  expect(first()).toContain(`Contents of ${API_MD} (subfolder instructions; apply when working in ${keyOf(PROJECT)}/api):\n\nValidate every endpoint.`)
-  expect(toasts.some(t => t.startsWith('CLAUDE.md pinned:'))).toBe(true)
-
-  // Claude Code reading its files again (a compaction, /clear) never holds subfolder files: kept.
-  await $.prompt.context(input)
-  await turn()
-  expect(chat.swaps).toBe(2)
-  expect(first()).toContain('Validate every endpoint.')
-})
-
-test('/compact summarizes as usual, then the CLAUDE.md message goes back first, whole', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 7_000_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, start } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-
-  write(PROJECT_MD, 'Use spaces.')
-  await clock.advance(1500)
-  for (const trigger of ['manual', 'auto'] as const) {
-    const done = await $.session.compact({ trigger, messages: chat.messages, instructions: 'keep the plan' })
-    const messages = done.messages ?? []
-    // The summarizer is told what the person typed, and nothing else.
-    expect(messages[1]?.text).toBe('Summary of the chat (keep the plan).')
-    expect(isMessage(messages[0]?.text ?? '')).toBe(true)
-    expect(messages[0]?.text).toContain('Use spaces.')
-    expect(messages.filter(isOwn).length).toBe(1)
-    chat.messages = [...messages]
-  }
-})
-
-test('/clear empties the chat, and the CLAUDE.md message is put back', async ($, on) => {
-  const { clock } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 7_500_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, sessionStart } = conversation($, on)
-  await $.prompt.context(input)
-  await start()
-
-  chat.messages = []
-  await sessionStart('clear')
-  await clock.advance(10)
-  expect(first()).toContain('Use tabs.')
-  expect(chat.messages.length).toBe(1)
-})
-
-test('a resumed chat is left alone when nothing changed, and its message rewritten when something did', async ($, on) => {
-  const held = render({
-    files: [
-      { path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 },
-      { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` },
-    ],
-    raw: null,
-    source: 'engine',
-  })
-  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_000_000)
+test('pins and sends what is on disk when Claude Code has not said which files it read', async ($, on) => {
+  world(on, { [PROJECT_MD]: 'Never commit to main.', [USER_MD]: 'Answer briefly.' }, 6_000_000)
   engine(on, null)
-  // Reopened in a new process: what is pinned, subfolder files included, is read back from the message.
-  const { chat, first, start } = conversation($, on, [{ role: 'user', text: held ?? '', toolUses: [] }, MESSAGE, REPLY])
-  await start()
-  expect(chat.swaps).toBe(0)
+  const { send, start } = conversation($, on)
 
-  write(API_MD, 'Validate every endpoint twice.')
   await start()
-  expect(chat.swaps).toBe(1)
-  expect(first()).toContain('Validate every endpoint twice.')
-  expect(first()).toContain('Use tabs.')
-  expect(chat.messages.filter(isOwn).length).toBe(1)
+  const block = await send('hello')
+  expect(block).toContain('Never commit to main.')
+  expect(block).toContain('Answer briefly.')
 })
 
-test("a resumed chat keeps the subfolder files its transcript's last message held", async ($, on) => {
-  const project = { path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 } as const
-  const older = render({ files: [project], raw: null, source: 'engine' }) ?? ''
-  const last = render({
-    files: [project, { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` }],
-    raw: null,
-    source: 'engine',
-  })
-  const TRANSCRIPT = `${HOME}/.claude/projects/app/s1.jsonl`
-  const row = (text: string) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
-  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_100_000)
-  write(TRANSCRIPT, [row(older), row('hello'), row(last ?? ''), ''].join('\n'))
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  // Claude Code reloads the chat through the history a rewrite replaced: the older message.
-  const { chat, first, start, sessionStart } = conversation($, on, [{ role: 'user', text: older, toolUses: [] }, MESSAGE, REPLY])
-  // In the order the terminal raises them: SessionStart, its own files read, then the chat starts.
-  await sessionStart('resume', TRANSCRIPT)
-  await $.prompt.context(input)
-  await start()
-  expect(chat.swaps).toBe(1)
-  expect(first()).toContain('Validate every endpoint.')
-
-  const done = await $.session.compact({ trigger: 'manual', messages: chat.messages })
-  chat.messages = [...(done.messages ?? [])]
-  expect(first()).toContain('Use tabs.')
-  expect(first()).toContain('Validate every endpoint.')
-})
-
-test('the chat does not draw the CLAUDE.md message; it draws every other message as usual', async ($, on) => {
+test('an older chat keeps the CLAUDE.md message an older version put first: it counts, and is never drawn', async ($, on) => {
+  const old = (line: string) =>
+    `<system-reminder>\n# CLAUDE.md\n\n${line} IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n${copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')}\n</system-reminder>`
+  const messages = [
+    old("This is the CLAUDE.md file: the user's instructions, exactly as they were on disk when this conversation was last compacted. If a later message in the conversation shows a newer version of one of these files, the newer version is current."),
+    old(OLD_HEADER.split('\n\n')[1]?.replace(/ IMPORTANT:.*$/, '') ?? ''),
+  ]
   // Claude Code beneath draws a user message as its text.
   on('ui.render', { component: 'UserMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return h(Text, {}, e.props.text) as RenderElement
   })
-  const own = render({ files: [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.', mtimeMs: 1 }], raw: null, source: 'engine' }) ?? ''
+  world(on, { [PROJECT_MD]: 'Use tabs.' }, 6_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { send, start } = conversation($, on, [{ role: 'user', content: messages[0] }])
+  await $.prompt.context({ ...input, blocks: [] })
+  await start()
+  expect(await send()).toBeUndefined()
+
   const row = (text: string) =>
     $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', component: 'UserMessage', props: { text, origin: { kind: 'unclassified' }, isExpanded: false } } as never)
-
-  const message = await row(own)
-  expect(await message.find({ text: 'Use tabs.' })).toBeUndefined()
-  await message.unmount()
+  for (const text of messages) {
+    expect(isMessage(text)).toBe(true)
+    const message = await row(text)
+    expect(await message.find({ text: /Use tabs\./ })).toBeUndefined()
+    await message.unmount()
+  }
   const prompt = await row('hello')
   expect(await prompt.find({ text: 'hello' })).toBeDefined()
   await prompt.unmount()
 })
 
-test('with nothing drawing the chat (-p, the SDK) the message is rewritten as a run starts, never after its answer', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 9_500_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, turn, changed } = conversation($, on)
-  await $.prompt.context(input)
-  await start(false)
-  expect(chat.swaps).toBe(1)
-
-  // The run prints the last result it has, so a rewrite after the answer would replace it.
-  await turn(async () => write(PROJECT_MD, 'Use spaces.'))
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(chat.swaps).toBe(1)
-
-  // The next run starts with it.
-  await start(false)
-  expect(chat.swaps).toBe(2)
-  expect(first()).toContain('Use spaces.')
-  await start(true)
-})
-
-test('in the desktop app the message is rewritten as in the terminal, once the app attaches', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 9_600_000)
-  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { chat, first, start, attach, turn, changed } = conversation($, on)
-  await $.prompt.context(input)
-  // The app starts Claude Code with nothing drawing it; a file edited before it opens the chat is
-  // put in the message when it attaches.
-  await start(false)
-  expect(chat.swaps).toBe(1)
-  await write(PROJECT_MD, 'Use spaces.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(chat.swaps).toBe(1)
-  await attach()
-  await clock.advance(10)
-  expect(chat.swaps).toBe(2)
-  expect(first()).toContain('Use spaces.')
-
-  // Then as in the terminal: at once between turns, and when a turn ends.
-  await write(PROJECT_MD, 'Use both.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(chat.swaps).toBe(3)
-  expect(first()).toContain('Use both.')
-  await turn(async () => {
-    await write(PROJECT_MD, 'Use neither.')
-    await changed(PROJECT_MD)
-    await clock.advance(10)
-    expect(chat.swaps).toBe(3)
-  })
-  expect(chat.swaps).toBe(4)
-  expect(first()).toContain('Use neither.')
-  expect(chat.messages.filter(isOwn).length).toBe(1)
-  await start(true)
-})
-
-test('text another plugin rewrote is pinned until the files on disk change', async ($, on) => {
-  const { clock, write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 6_000_000)
+test('text another plugin rewrote stands for the startup files until they change on disk', async ($, on) => {
+  const { write } = world(on, { [PROJECT_MD]: 'Rule A.' }, 7_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Rule A.' }], { rewrittenAs: 'Rewritten rule A.' })
-  const { first, start, changed } = conversation($, on)
+  const { send, start } = conversation($, on)
   await $.prompt.context(input)
   await start()
-  expect(first()).toContain('Rewritten rule A.')
+  expect(await send('hello')).toBeUndefined()
 
   write(PROJECT_MD, 'Rule B.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(first()).toContain('Rule B.')
-  expect(first()).not.toContain('Rewritten rule A.')
+  expect(await send()).toContain('Rule B.')
 })
 
-test('the message reads back as the files it holds', () => {
-  const text = render({
-    files: [
-      { path: USER_MD, kind: 'user', content: 'Answer briefly.\n', mtimeMs: 1 },
-      { path: PROJECT_MD, kind: 'project', content: '# Rules\n\nUse tabs.\n\n(see notes)', mtimeMs: 1 },
-      { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` },
-    ],
-    raw: null,
-    source: 'engine',
-  })
-  expect(filesOf(text ?? '')).toEqual([
-    { path: USER_MD, kind: 'user', content: 'Answer briefly.', mtimeMs: -1 },
-    { path: PROJECT_MD, kind: 'project', content: '# Rules\n\nUse tabs.\n\n(see notes)', mtimeMs: -1 },
-    { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: -1, scope: `${PROJECT}/api` },
+test('the hidden block holds each file whole, under a heading naming where it is and what it is', () => {
+  const block = blockOf([
+    { path: USER_MD, kind: 'user', content: 'Answer briefly.\n', mtimeMs: 1 },
+    { path: API_MD, kind: 'project', content: 'Validate every endpoint.', mtimeMs: 1, scope: `${PROJECT}/api` },
+    { path: LOCAL_MD, kind: 'local', content: '  ', mtimeMs: 1 },
   ])
-  expect(filesOf('hello')).toBeNull()
+  expect(block).toBe(
+    [
+      '# CLAUDE.md',
+      "These are the user's CLAUDE.md instructions, exactly as they are on disk now. Their current text isn't in this conversation, so here it is: where anything earlier in the conversation differs, this is current. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.",
+      `Contents of ${USER_MD} (user's private global instructions for all projects):\n\nAnswer briefly.`,
+      `Contents of ${API_MD} (subfolder instructions; apply when working in ${PROJECT}/api):\n\nValidate every endpoint.`,
+    ].join('\n\n'),
+  )
+  expect(blockOf([])).toBeNull()
+
+  // Found in what Claude reads: whole, with Windows line endings, without its HTML comments, or numbered.
+  const rules = 'Use tabs.\r\n<!-- for the team -->\r\nRun the tests.'
+  expect(isHeld(rules, contextOf([{ role: 'user', content: 'Use tabs.\n<!-- for the team -->\nRun the tests.' }]))).toBe(true)
+  expect(isHeld(rules, contextOf([], ['Use tabs.\n\nRun the tests.']))).toBe(true)
+  expect(isHeld(rules, contextOf([], ['Use tabs.']))).toBe(false)
+  expect(isHeld(rules, contextOf([{ role: 'user', content: [{ type: 'tool_result', content: '1\tUse tabs.\n2\t<!-- for the team -->\n3\tRun the tests.' }] }]))).toBe(true)
+  expect(isHeld(rules, contextOf([{ role: 'assistant', content: [{ type: 'thinking', thinking: rules }] }]))).toBe(false)
+  expect(isHeld('', contextOf([]))).toBe(true)
 })
 
 test('unpins a subfolder CLAUDE.md after 10 messages without work there', async ($, on) => {
-  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_800_000)
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 9_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { first, start, turn } = conversation($, on)
+  const { send, start, turn } = conversation($, on)
   tools(on)
   await $.prompt.context(input)
   await start()
   await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
-
-  const send = async (count: number) => {
-    for (let i = 0; i < count; i++) await $.prompt.submit(SUBMIT)
-    await turn()
-    return first() ?? ''
+  const pins = async (count: number) => {
+    for (let i = 0; i < count; i++) await send()
+    return pinned($)
   }
 
   // Work in the folder (a search counts) resets the count.
-  expect(await send(6)).toContain('Validate every endpoint.')
+  expect(await pins(6)).toContain(API_MD)
   await turn(() => $.tool.call({ tool: 'Grep', tool_use_id: 't2', pattern: 'x', path: `${PROJECT}/api` }))
-  expect(await send(9)).toContain('Validate every endpoint.')
-  const text = await send(1)
-  expect(text).not.toContain('Validate every endpoint.')
-  expect(text).toContain('Use tabs.')
+  expect(await pins(9)).toContain(API_MD)
+  const after = await pins(1)
+  expect(after).not.toContain(API_MD)
+  expect(after).toContain(PROJECT_MD)
   expect(toasts.some(t => t.startsWith('CLAUDE.md unpinned:'))).toBe(true)
 
   // Opening a file there again pins it again.
   await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't3', file_path: API_FILE }))
-  expect(first()).toContain('Validate every endpoint.')
+  expect(await pinned($)).toContain(API_MD)
 })
 
 test('each subfolder CLAUDE.md counts down on its own, and the startup files never unpin', async ($, on) => {
@@ -688,23 +566,21 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
   )
   tools(on)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { first, start, turn } = conversation($, on)
+  const { send, start } = conversation($, on)
   await $.prompt.context(input)
   await start()
   await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
-
-  const send = async (count: number) => {
-    for (let i = 0; i < count; i++) await $.prompt.submit(SUBMIT)
-    await turn()
-    return first() ?? ''
+  const pins = async (count: number) => {
+    for (let i = 0; i < count; i++) await send()
+    return pinned($)
   }
 
   // The web folder's file is pinned 4 messages after the api folder's, so it unpins 4 messages later.
-  await send(4)
+  await pins(4)
   await $.tool.call({ tool: 'Read', tool_use_id: 't2', file_path: `${PROJECT}/web/page.tsx` })
-  const both = await send(5)
-  expect(both).toContain('Validate every endpoint.')
-  expect(both).toContain('Keep pages accessible.')
+  const both = await pins(5)
+  expect(both).toContain(API_MD)
+  expect(both).toContain(WEB_MD)
   // The line shows each one's own count, the one closest to unpinning first.
   for (const surface of ['terminal', 'desktop'] as const) {
     const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
@@ -739,15 +615,15 @@ test('each subfolder CLAUDE.md counts down on its own, and the startup files nev
     await narrow.unmount()
   }
   // 10 messages since the api folder, 6 since the web folder.
-  const one = await send(1)
-  expect(one).not.toContain('Validate every endpoint.')
-  expect(one).toContain('Keep pages accessible.')
-  expect(await send(3)).toContain('Keep pages accessible.')
-  const none = await send(1)
-  expect(none).not.toContain('Keep pages accessible.')
+  const one = await pins(1)
+  expect(one).not.toContain(API_MD)
+  expect(one).toContain(WEB_MD)
+  expect(await pins(3)).toContain(WEB_MD)
+  const none = await pins(1)
+  expect(none).not.toContain(WEB_MD)
   // The startup file stays through it all.
-  expect(none).toContain('Use tabs.')
-  expect(await send(20)).toContain('Use tabs.')
+  expect(none).toContain(PROJECT_MD)
+  expect(await pins(20)).toContain(PROJECT_MD)
 })
 
 test('the line shows what is pinned and hides; the pane lists each file and brings the line back', async ($, on) => {
@@ -809,6 +685,23 @@ test('the pane opens a file read-only and goes back to the list', async ($, on) 
     expect(await pane.find({ text: /1 file pinned/ })).toBeDefined()
     await pane.unmount()
   }
+})
+
+test('opening a file in the pane reads it from disk, with no watcher and no timer', async ($, on) => {
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 13_500_000)
+  await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
+
+  // Changed on disk with no word from Claude Code's watcher.
+  write(PROJECT_MD, 'Use spaces.')
+  const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
+  await pane.press({ key: `open:${keyOf(PROJECT_MD)}` })
+  expect((await pane.find({ type: 'Markdown' }))?.text).toBe('Use spaces.')
+
+  // Created where nothing was watched: listed once the pane goes back to the list.
+  write(LOCAL_MD, 'My local rule.')
+  await pane.press({ key: 'back' })
+  expect(await pane.find({ text: LOCAL_MD })).toBeDefined()
+  await pane.unmount()
 })
 
 test('/claudemd opens the pane on the list, and closes it when it is open', async ($, on) => {
@@ -934,6 +827,7 @@ test("on the desktop the open file's name, where it comes from and its size stay
   const { clock } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 16_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
   tools(on)
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
   await $.prompt.context(input)
   await $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE })
   const scrolledDown = { ...PANE, props: { ...PANE.props, scroll: { offset: 5, bodyRows: 12 } } }
@@ -1063,58 +957,41 @@ test('in the terminal the line sits under the hint line below the prompt, styled
   expect(statuses.filter(s => s !== undefined)).toEqual([])
 })
 
-test("another chat's band choice and an edited CLAUDE.md show here as soon as the files change", async ($, on) => {
-  const { clock, stored, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 18_000_000)
+test("a band choice made in another chat shows here at the next message", async ($, on) => {
+  const { stored } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 18_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { first, start, sessionStart, changed } = conversation($, on)
+  const { send, start } = conversation($, on)
   await $.prompt.context(input)
   await start()
-
-  // A fresh install keeps its choice first, so there is a store file to watch, beside the pinned files.
-  const started = await sessionStart('startup')
-  expect(started.watchPaths).toEqual([STORE_FILE, PROJECT_MD])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const band = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
     expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
 
-    // Another chat hides the band: its write changes the store file, reported in Windows' spelling.
+    // Another chat hides the band, then shows it again: kept in the store every chat shares.
     stored.set('isBandShown', false)
-    await changed(STORE_FILE.replace(/\//g, '\\').toUpperCase())
-    await clock.advance(10)
+    await send()
     expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeUndefined()
     stored.set('isBandShown', true)
-    await changed(STORE_FILE)
-    await clock.advance(10)
+    await send()
     expect(await band.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
     await band.unmount()
   }
-
-  // A CLAUDE.md edited anywhere is pinned again at once, not at this chat's next message.
-  write(PROJECT_MD, 'Use spaces.')
-  await changed(PROJECT_MD)
-  await clock.advance(10)
-  expect(toasts).toContain('CLAUDE.md changed: re-pinned')
-  expect(first()).toContain('Use spaces.')
 })
 
-test('a CLAUDE.md that links to AGENTS.md is watched where it points, and re-pinned when that changes', async ($, on) => {
+test('a CLAUDE.md that links to AGENTS.md is read through the link', async ($, on) => {
   const AGENTS_MD = `${PROJECT}/AGENTS.md`
-  const { clock, toasts, write } = world(on, { [PROJECT_MD]: 'Use tabs.', [AGENTS_MD]: 'Use tabs.' }, 23_000_000, {
-    [PROJECT_MD]: AGENTS_MD,
-  })
+  const { toasts, write } = world(on, { [AGENTS_MD]: 'Use tabs.' }, 23_000_000, { [PROJECT_MD]: AGENTS_MD })
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
-  const { first, start, sessionStart, changed } = conversation($, on)
+  const { chat, send, add, start } = conversation($, on)
   await $.prompt.context(input)
   await start()
-  const started = await sessionStart('startup')
-  expect(started.watchPaths).toContain(AGENTS_MD)
+  await send('hello')
+  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
 
-  // An edit to AGENTS.md is an edit to CLAUDE.md, reported by the target's name.
+  // Only AGENTS.md is edited: CLAUDE.md, read through the link, has changed with it.
   write(AGENTS_MD, 'Use spaces.')
-  write(PROJECT_MD, 'Use spaces.')
-  await changed(AGENTS_MD)
-  await clock.advance(10)
-  expect(toasts).toContain('CLAUDE.md changed: re-pinned')
-  expect(first()).toContain('Use spaces.')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.'))
+  expect(toasts).toContain('CLAUDE.md changed')
+  expect(chat.swaps).toBe(0)
 })

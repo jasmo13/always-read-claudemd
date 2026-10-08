@@ -1,26 +1,27 @@
 import { atom, read, update } from 'claude-code'
-import type { ClientElements, EngineInterface, Register, RenderElement, SessionMessage } from 'claude-code'
+import type { ClientElements, EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type { Pin, PinnedFile } from '../types'
 import {
   FILE_TOOLS,
-  HEADER,
   PROJECT_NAMES,
   TIERS,
   UNPIN_AFTER,
+  blockOf,
+  contextOf,
   countOf,
   displayPath,
-  filesOf,
   folderName,
   formatTokens,
   isAbsolute,
   isBlank,
+  isHeld,
   isInside,
   isMessage,
   keyOf,
   messagesLeft,
   pathsOf,
-  render,
+  pinnedText,
   bandLayout,
   scrollBar,
   scrolled,
@@ -41,107 +42,19 @@ const bandAtom = atom({ plugin: 'always-read-claudemd', key: 'isBandShown' } as 
 const viewingAtom = atom({ plugin: 'always-read-claudemd', key: 'viewing' } as const, null)
 const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as const, 0)
 
-// The turns running now, so a file changed between them rewrites the CLAUDE.md message at once.
-const running = new Set<string>()
-// Whether the CLAUDE.md message is being rewritten, so a second change waits for the first.
-let isSwapping = false
-// How many prompts the chat held when last drawn, so a rewind, which takes some away, is noticed.
-let promptsSeen = 0
 /**
- * Whether someone is watching the chat: the terminal, or an app showing it (the desktop app attaches
- * when it opens a chat). A run with neither (-p, a bare SDK app) prints the last result it has, and a
- * rewrite after the answer would be that result, so there the message is rewritten only as it starts.
+ * The CLAUDE.md text Claude Code is about to give Claude with the next message: it reads its files
+ * for a new chat, after a compaction or /clear, and on resume, and adds them to the message only
+ * after that message's hooks have run. Spent by that message.
  */
-const isWatched = async ($: EngineInterface) => (await $.session.surfaces()).length > 0
-
-/** Whether a message is the CLAUDE.md message. */
-const isOwn = (m: SessionMessage) => m.role === 'user' && isMessage(m.text)
-
+let announced: string[] = []
 /**
- * The CLAUDE.md message as the chat holds it now; null when it has none. The history keeps the ones
- * each rewrite replaced, so the chat's own is the latest.
+ * The blocks sent with messages typed while Claude was working. Those messages can join that turn
+ * together, so one's block isn't in the conversation yet when the next is checked: kept for that turn.
  */
-async function heldText($: EngineInterface): Promise<string | null> {
-  return (await $.session.messages()).findLast(isOwn)?.text ?? null
-}
-
-/** The CLAUDE.md message as it should be, as a message of the chat. */
-const ownMessage = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
-
-/**
- * Brings the CLAUDE.md message in step with disk: re-reads the files, and when what the chat holds
- * differs (or it holds none), compacts the chat in a way that only puts the message back first.
- */
-async function refresh($: EngineInterface) {
-  await sync($).catch(() => undefined)
-  if (isSwapping) return
-  const text = render(await read($, pinAtom))
-  const held = await heldText($)
-  if ((text?.trim() ?? null) === (held?.trim() ?? null)) return
-  isSwapping = true
-  try {
-    await $.command.run({ command: 'compact' })
-    // Which of Claude Code's copies are left out depends on what the message holds: ask again.
-    $.ui.invalidate('prompt.attachment')
-  } finally {
-    isSwapping = false
-  }
-}
-
-/**
- * A resumed chat's CLAUDE.md message as its transcript last wrote it; null for a chat that wasn't
- * resumed. Claude Code reloads a chat through the history each rewrite replaced (it links a rewritten
- * tool result to the old tool call), so the chat it loads can hold an older message than the last.
- */
-let resumed: Promise<string | null> = Promise.resolve(null)
-
-async function lastWritten($: EngineInterface, transcript: string): Promise<string | null> {
-  const lines = String(await $.fs.read(transcript)).split('\n')
-  // Each row is JSON: the header's line breaks are escaped there.
-  const header = JSON.stringify(HEADER).slice(1, -1)
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i]?.includes(header)) continue
-    const row = JSON.parse(lines[i] ?? '') as { type?: string; message?: { content?: unknown } }
-    const content = row.message?.content
-    const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map(b => (b as { text?: string }).text ?? '').join('') : ''
-    if (row.type === 'user' && isMessage(text)) return text
-  }
-  return null
-}
-
-/**
- * A rewind restores the chat as it was, CLAUDE.md message included, and that message can be older
- * than the files: the chat holds fewer prompts than before, and the message is brought in step with
- * disk before the next one.
- */
-async function noticeRewind($: EngineInterface) {
-  const prompts = await $.session.turns()
-  const isBack = prompts < promptsSeen
-  promptsSeen = prompts
-  if (isBack && running.size === 0) await refresh($)
-}
-
-/**
- * Checks the files: between turns, in a chat someone is watching, the CLAUDE.md message is
- * rewritten at once if they changed; otherwise they're re-read, and it's rewritten when the turn ends.
- */
-async function check($: EngineInterface) {
-  if (running.size === 0 && (await isWatched($))) await refresh($)
-  else await sync($)
-}
-
-/** The CLAUDE.md message a chat opened in this process last had: its transcript's when resumed. */
-async function lastHeld($: EngineInterface) {
-  return (await resumed.catch(() => null)) ?? (await heldText($))
-}
-
-/** A chat resumed in a new process: what its CLAUDE.md message holds is what is pinned. */
-async function recall($: EngineInterface) {
-  if ((await read($, pinAtom)).source !== null) return
-  const held = await lastHeld($)
-  const files = held === null ? null : filesOf(held)
-  if (files !== null && files.length > 0) await settle($, { files, raw: null, source: 'discovered' })
-}
+let sentMidTurn: { turnId: string; blocks: string[] } | undefined
+// Pinned files deleted since the last message, with the text they had, so Claude can be told.
+let gone: PinnedFile[] = []
 
 async function mtimeOf($: EngineInterface, path: string): Promise<number | undefined> {
   return (await $.fs.stat(path).catch(() => undefined))?.mtimeMs
@@ -193,7 +106,7 @@ async function discover($: EngineInterface): Promise<PinnedFile[]> {
  */
 function lineOf(pin: Pin, turn: number) {
   const count = countOf(pin)
-  const summary = `${count} ${count === 1 ? 'file' : 'files'}, ~${formatTokens(tokensOf(render(pin) ?? ''))} tokens`
+  const summary = `${count} ${count === 1 ? 'file' : 'files'}, ~${formatTokens(tokensOf(pinnedText(pin)))} tokens`
   const nested = pin.files
     .flatMap(f => (f.scope === undefined ? [] : [{ folder: folderName(f.scope), left: messagesLeft(f, turn) }]))
     .sort((a, b) => a.left - b.left)
@@ -245,38 +158,6 @@ function pinnedLine(
           </Box>,
         ]),
   ]
-}
-
-/**
- * The plugin's own files in Claude Code's store, one per place it was installed from
- * (`always-read-claudemd_<source>-<hash>.json`). A choice made in any chat is written there, so
- * every chat watches them. A fresh install has none until something is kept, so one is kept first.
- */
-async function storeFiles($: EngineInterface): Promise<string[]> {
-  const userDir = await userDirOf($)
-  if (userDir === undefined) return []
-  const dir = `${userDir}/plugins/store`
-  const list = async () =>
-    (await $.fs.list(dir).catch(() => []))
-      .filter(f => f.name.startsWith(`${PANE}_`) && f.name.endsWith('.json'))
-      .map(f => `${dir}/${f.name}`)
-  const files = await list()
-  if (files.length > 0) return files
-  await $.store.set(BAND_KEY, await read($, bandAtom))
-  return list()
-}
-
-/** Whether a path is one of the plugin's store files, in either slash and any case, as Windows allows. */
-const isStoreFile = (path: string) => /\/plugins\/store\/always-read-claudemd_[^/]*\.json$/.test(keyOf(path))
-
-/** Where each of these paths leads when it's a symbolic link, such as a CLAUDE.md that points to AGENTS.md. */
-async function linkTargets($: EngineInterface, paths: string[]): Promise<string[]> {
-  const targets: string[] = []
-  for (const path of paths) {
-    const real = (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath
-    if (real !== undefined && keyOf(real) !== keyOf(path)) targets.push(real)
-  }
-  return targets
 }
 
 /** Shows or hides the band as it was last chosen, in this chat or another. */
@@ -345,6 +226,7 @@ async function sync($: EngineInterface): Promise<void> {
     const mtimeMs = await mtimeOf($, file.path)
     if (mtimeMs === undefined) {
       removed.push(file.path)
+      gone.push(file)
       continue
     }
     if (mtimeMs === file.mtimeMs) {
@@ -354,6 +236,7 @@ async function sync($: EngineInterface): Promise<void> {
     const content = await $.fs.read(file.path).catch(() => undefined)
     if (typeof content !== 'string') {
       removed.push(file.path)
+      gone.push(file)
       continue
     }
     if (content.trim() !== file.content.trim()) edited.push(file.path)
@@ -384,7 +267,7 @@ async function sync($: EngineInterface): Promise<void> {
   // Raw text can't be patched per file: once the disk moves, pin what is on disk.
   const next: Pin = { files, raw: null, source: pin.source === 'engine' ? 'engine' : 'discovered' }
   await settle($, next, pin.source === null ? undefined : change)
-  if (pin.source !== null) $.ui.toast('CLAUDE.md changed: re-pinned')
+  if (pin.source !== null) $.ui.toast('CLAUDE.md changed')
 }
 
 /**
@@ -446,6 +329,33 @@ async function age($: EngineInterface): Promise<void> {
   $.ui.toast(`CLAUDE.md unpinned: ${stale.map(f => displayPath(f.path, places)).join(', ')}`)
 }
 
+/**
+ * The hidden block for the message being sent: every pinned file whose whole text, as it is on
+ * disk now, isn't in the conversation as Claude reads it (counting what Claude Code is about to
+ * give it), and every pinned file deleted since whose old text is. Null when Claude has them all.
+ */
+async function missing($: EngineInterface, turnId: string | undefined): Promise<string | null> {
+  const pin = await read($, pinAtom)
+  const sameTurn = turnId !== undefined && sentMidTurn?.turnId === turnId ? sentMidTurn.blocks : []
+  const context = contextOf(await $.session.messages({ as: 'api' }), [...announced, ...sameTurn])
+  announced = []
+  const isPinned = (file: PinnedFile) => pin.files.some(f => keyOf(f.path) === keyOf(file.path))
+  const removed = gone.filter(f => !isPinned(f) && isHeld(f.content, context))
+  gone = []
+  // Text another plugin rewrote stands for the startup files until they change on disk.
+  const files = (pin.source === 'raw' ? pin.files.filter(f => f.scope !== undefined) : pin.files).filter(f => !isHeld(f.content, context))
+  const block = blockOf(files, removed)
+  if (block === null) return null
+  if (turnId !== undefined) sentMidTurn = { turnId, blocks: [...sameTurn, block] }
+
+  const places = await placesOf($)
+  const names = [...files.map(f => displayPath(f.path, places)), ...removed.map(f => `${displayPath(f.path, places)} (removed)`)]
+  const turn = await read($, turnAtom)
+  await update($, changeAtom, () => ({ text: `Sent to Claude: ${names.join(', ')}`, turn }))
+  $.ui.toast(`CLAUDE.md sent to Claude: ${names.join(', ')}`)
+  return block
+}
+
 async function setBand($: EngineInterface, isShown: boolean) {
   await update($, bandAtom, () => isShown)
   await $.store.set(BAND_KEY, isShown).catch(() => undefined)
@@ -479,9 +389,10 @@ function markdownRows(markdown: string, columns: number): number {
     .reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / columns)) + (/^#{1,6} /.test(line) ? 1 : 0), 0)
 }
 
-/** Opens the pane on its list of files; an open pane is left as it is. */
+/** Opens the pane on its list of files, as they are on disk now; an open pane is left as it is. */
 async function openPane($: EngineInterface) {
   if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
+  await sync($).catch(() => undefined)
   await update($, viewingAtom, () => null)
   await update($, paneTopAtom, () => 0)
   await $.ui.open({ id: PANE, title: TITLE })
@@ -502,53 +413,8 @@ export const register: Register = on => {
       description: 'Open or close the pane showing what CLAUDE.md is pinned; "/claudemd band" shows or hides its line',
     }).catch(() => undefined)
     await followBand($)
-    await recall($).catch(() => undefined)
-    // A new chat gets its CLAUDE.md message first; a resumed one has it rewritten if the files changed.
-    await refresh($).catch(() => undefined)
-    // Only files that exist are watched: once a second the files are checked too, so a CLAUDE.md
-    // created where there was none is pinned within a second.
-    $.clock.every(1000, () => void check($).catch(() => undefined))
 
     return started
-  })
-
-  // Every chat watches the plugin's store files and the CLAUDE.md files it pins, and where any of
-  // them links to, so a choice made in another chat, or a file edited anywhere, shows in each open
-  // chat at once, not at its next message.
-  on('classic.SessionStart', async ($, e, next) => {
-    // Raised before Claude Code reads its files for a resumed chat, and before session.start.
-    if (e.agent_id === undefined && e.source === 'resume') resumed = lastWritten($, e.transcript_path)
-    const result = await next(e)
-    // /clear empties the chat, its CLAUDE.md message with it: put it back once the clear is done.
-    if (e.agent_id === undefined && e.source === 'clear') void $.clock.sleep(0).then(() => refresh($)).catch(() => undefined)
-    const pinned = (await read($, pinAtom)).files.map(f => f.path)
-    const found = (await discover($).catch(() => [])).map(f => f.path)
-    const instructions = [...pinned, ...found]
-    const files = [
-      ...(await storeFiles($).catch(() => [])),
-      ...instructions,
-      ...(await linkTargets($, instructions).catch(() => [])),
-    ]
-    const watched = files.filter((path, i) => files.findIndex(p => keyOf(p) === keyOf(path)) === i)
-    return watched.length === 0 ? result : { ...result, watchPaths: [...(result.watchPaths ?? []), ...watched] }
-  })
-
-  // Claude Code tells every plugin of every watched file's change, other plugins' store files too:
-  // those are theirs. This plugin's own store file is known by name, so a hot reload (which keeps
-  // the watch but forgets the module's variables) still hears it. Every other path is an instruction
-  // file, or the file one links to.
-  on('classic.FileChanged', ($, e, next) => {
-    if (isStoreFile(e.file_path)) void followBand($).catch(() => undefined)
-    else if (!keyOf(e.file_path).includes('/plugins/store/')) void check($).catch(() => undefined)
-    return next(e)
-  })
-
-  // An app opened the chat (the desktop app, after it was in the background): files changed while no
-  // one watched are put in the CLAUDE.md message now, before the next message.
-  on('session.attach', async ($, e, next) => {
-    const attached = await next(e)
-    if (running.size === 0) void $.clock.sleep(0).then(() => refresh($)).catch(() => undefined)
-    return attached
   })
 
   // Answers with toasts and the pane alone: nothing is written to the chat.
@@ -566,23 +432,22 @@ export const register: Register = on => {
     return {}
   })
 
-  // Capture the engine's own CLAUDE.md block (every tier, @imports resolved): the CLAUDE.md message
-  // carries the same files.
+  // Claude Code reads its CLAUDE.md files (every tier, @imports resolved) for a new chat, after a
+  // compaction or /clear, and on resume: they're what is pinned, and what Claude is about to be given
+  // with the next message.
   on('prompt.context', async ($, e, next) => {
     const context = await next(e)
     const block = context.blocks.find(b => b.name === 'claudeMd')
+    const instructionFiles = context.instructionFiles ?? []
+    announced = block === undefined ? [] : [block.text, ...instructionFiles.map(f => f.content)]
     // No block (none on disk, or a subagent that omits it): leave the pin as is;
     // sync notices deletions by itself.
     if (block === undefined || block.text.trim() === '') return context
 
     const old = await read($, pinAtom)
-    const instructionFiles = context.instructionFiles ?? []
     const engineKeys = new Set(instructionFiles.map(f => keyOf(f.path)))
-    // Subfolder pins outlive a re-read (compaction, /clear): the engine's block never holds them. A
-    // resumed chat can read its files before session.start recalls its pin: they are in its message.
-    const held = old.source === null ? await lastHeld($).catch(() => null) : null
-    const kept = held === null ? old.files : (filesOf(held) ?? [])
-    const nested = kept.filter(f => f.scope !== undefined && !engineKeys.has(keyOf(f.path)))
+    // Subfolder pins outlive a re-read (compaction, /clear): the engine's block never holds them.
+    const nested = old.files.filter(f => f.scope !== undefined && !engineKeys.has(keyOf(f.path)))
     const pin: Pin =
       instructionFiles.length === 0
         ? // Another plugin rewrote the text: pin it as is, and watch what is on disk.
@@ -610,70 +475,25 @@ export const register: Register = on => {
     return context
   })
 
-  // Claude Code's own copies of the files ride with messages as attachments: the whole set with the
-  // first message (and again when a file changes), and a subfolder's file when Claude works there.
-  // Once the chat has the CLAUDE.md message, the main chat reads them there alone: its copies are
-  // left out, a subfolder's once the message holds it. A subagent keeps its own.
-  on('prompt.attachment', async ($, e, next) => {
-    const shown = await next(e)
-    if (e.agentId !== undefined || shown.text === null) return shown
-    if (e.type !== 'instructions' && e.type !== 'nested_memory') return shown
-    const held = await heldText($).catch(() => null)
-    if (held === null) return shown
-    if (e.type === 'instructions') return { text: null }
-    const [, path] = /^Contents of (.+?):\s*$/m.exec(e.text) ?? []
-    const isHeld = path !== undefined && (filesOf(held) ?? []).some(f => keyOf(f.path) === keyOf(path))
-    return isHeld ? { text: null } : shown
-  })
-
+  // A new message: the one check. Follow a band choice made in another chat, age the subfolder pins,
+  // re-read the files from disk, and attach what Claude lacks to the message.
   on('prompt.submit', async ($, e, next) => {
+    await followBand($).catch(() => undefined)
     await age($).catch(() => undefined)
-    return next(e)
+    await sync($).catch(() => undefined)
+    const block = await missing($, e.turnId).catch(() => null)
+    return next(block === null ? e : { ...e, context: [...(e.context ?? []), block] })
   })
 
-  // Claude opened a file: pin its subfolder's CLAUDE.md, put in the CLAUDE.md message when the turn ends.
+  // Claude opened a file: pin its subfolder's CLAUDE.md, sent with a message when Claude lacks it.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     await touch($, pathsOf(e as unknown as Record<string, unknown>), FILE_TOOLS.has(e.tool)).catch(() => undefined)
     return ran
   })
 
-  on('turn.start', ($, e, next) => {
-    running.add(e.turnId)
-    return next(e)
-  })
-
-  // A turn ended: if the files changed while it ran, or a subfolder's file was pinned or unpinned,
-  // the CLAUDE.md message is rewritten now, before the next message.
-  on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    running.delete(e.turnId)
-    if (e.agentId === undefined && running.size === 0 && (await isWatched($))) await refresh($).catch(() => undefined)
-    return done
-  })
-
-  on('session.compact', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
-    await sync($).catch(() => undefined)
-    const text = render(await read($, pinAtom))
-
-    // The plugin's own compaction: nothing is summarized. The chat stays as it is, with the old
-    // CLAUDE.md message taken out and the new one put first.
-    if (isSwapping) {
-      const rest = e.messages.filter(m => !isOwn(m))
-      return { messages: text === null ? rest : [ownMessage(text), ...rest] }
-    }
-
-    // Any other compaction summarizes as usual, and the CLAUDE.md message goes back first, whole.
-    const compacted = await next(e)
-    if (compacted.messages === undefined) return compacted
-    const rest = compacted.messages.filter(m => !isOwn(m))
-    return { ...compacted, messages: text === null ? rest : [ownMessage(text), ...rest] }
-  })
-
-  // The chat doesn't draw the CLAUDE.md message: the line and the pane show what is pinned, and a
-  // toast says when it changes. (The /compact that rewrites it is drawn by Claude Code, which never
-  // asks a plugin to draw the rows it caused.)
+  // The chat doesn't draw the CLAUDE.md message versions before 0.9.0 put first in it: the line and
+  // the pane show what is pinned.
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (!isMessage(e.props.text.trim())) return next(e)
     const { Box } = $.ui.resolve(e)
@@ -704,8 +524,6 @@ export const register: Register = on => {
   // plugin's band. The terminal draws the same line under the prompt instead (see PromptHint).
   // Colors are theme keys or dim alone, never raw, so it reads in light and dark themes.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // Claude Code redraws this slot after a rewind, on every surface.
-    void noticeRewind($).catch(() => undefined)
     if (e.surface === 'terminal' || e.props.hasSurvey || !(await read($, bandAtom))) return next(e)
 
     // The slot holds one tree, so draw the other plugins' bands too rather than replacing them,
@@ -757,7 +575,7 @@ export const register: Register = on => {
     const top = await read($, paneTopAtom)
     const places = await placesOf($)
     const count = countOf(pin)
-    const text = render(pin)
+    const text = pinnedText(pin)
     // The terminal sends the wheel and page keys here, so there the pane is clipped to its height
     // and scrolls its own body under a fixed top. Other surfaces, the desktop app among them, scroll
     // the whole pane themselves, top included, so there it's drawn whole and the open file's name
@@ -765,10 +583,13 @@ export const register: Register = on => {
     const isFixed = e.surface === 'terminal'
     // The width text wraps at: the body less its margins, and the scroll bar with its gap.
     const columns = Math.max(1, e.props.bodyColumns - 2 * MARGIN - (isFixed ? 2 : 0))
+    // Opening a file, or going back to the list, reads the files from disk first: the pane shows them
+    // as they are now, even one not watched yet (a subfolder's pinned mid-chat, one just created).
     const view = (id: string | null) => () =>
       void (async () => {
         await update($, viewingAtom, () => id)
         await update($, paneTopAtom, () => 0)
+        await sync($).catch(() => undefined)
         if (!isFixed) await $.ui.open({ id: PANE, title: await titleFor($, id) })
       })().catch(() => undefined)
 
@@ -964,12 +785,12 @@ export const register: Register = on => {
           <Text bold>{`${count} ${count === 1 ? 'file' : 'files'} pinned`}</Text>
         </Box>
         <Box flexShrink={1} minWidth={0}>
-          <Text dimColor wrap="truncate-end">{`~${formatTokens(tokensOf(text ?? ''))} tokens`}</Text>
+          <Text dimColor wrap="truncate-end">{`~${formatTokens(tokensOf(text))} tokens`}</Text>
         </Box>
       </Box>,
       <Box flexDirection="column">
         <Text dimColor wrap="truncate-end">
-          Kept in sync with disk. Press a file to read it.
+          As on disk now. Press a file to read it.
         </Text>
 
         {isRaw && heading('Loaded at startup')}

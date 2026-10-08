@@ -1,7 +1,7 @@
 {
   "name": "always-read-claudemd",
-  "version": "0.7.1",
-  "description": "Keeps your CLAUDE.md as the first message of every chat, word for word, rewritten when the files change and put back after every compaction.",
+  "version": "0.9.0",
+  "description": "Sends your CLAUDE.md, word for word, as a hidden part of your next message whenever Claude doesn't have its current text: after an edit made outside Claude Code, or a compaction that dropped a subfolder's file. It never compacts a chat or changes the system prompt.",
   "author": { "name": "Jake Campbell" },
   "license": "MIT",
   "types": "./types/index.d.ts"
