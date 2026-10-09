@@ -4,7 +4,7 @@ export type PinnedFile = {
   path: string
   /** `managed`, `user`, `project`, `local` or `memory`. */
   kind: string
-  /** The file's text as last read. */
+  /** The file's text as last read, as Claude Code's loader gives it to Claude (no HTML comments or frontmatter). */
   content: string
   /** Last modification seen, ms since the epoch; -1 when not yet stat'd. */
   mtimeMs: number

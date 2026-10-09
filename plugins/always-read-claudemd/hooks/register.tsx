@@ -8,7 +8,8 @@ import {
   TIERS,
   UNPIN_AFTER,
   blockOf,
-  contextOf,
+  copiedPaths,
+  copiesOf,
   countOf,
   displayPath,
   folderName,
@@ -18,7 +19,9 @@ import {
   isHeld,
   isInside,
   isMessage,
+  isSubfolderName,
   keyOf,
+  lastCopy,
   messagesLeft,
   pathsOf,
   pinnedText,
@@ -27,6 +30,7 @@ import {
   scrolled,
   tabTitle,
   tokensOf,
+  unpinnedFile,
 } from './pin'
 
 const PANE = 'always-read-claudemd'
@@ -53,11 +57,22 @@ let announced: string[] = []
  * together, so one's block isn't in the conversation yet when the next is checked: kept for that turn.
  */
 let sentMidTurn: { turnId: string; blocks: string[] } | undefined
-// Pinned files deleted since the last message, with the text they had, so Claude can be told.
-let gone: PinnedFile[] = []
 
 async function mtimeOf($: EngineInterface, path: string): Promise<number | undefined> {
   return (await $.fs.stat(path).catch(() => undefined))?.mtimeMs
+}
+
+/**
+ * A file's text as Claude Code's own loader gives it to Claude: HTML comments and frontmatter left
+ * out. Where the loader can't reach it, the file as it is; undefined when it can't be read.
+ */
+async function textOf($: EngineInterface, path: string): Promise<string | undefined> {
+  const dir = path.replace(/[\\/][^\\/]*$/, '')
+  const request = { names: [path.slice(dir.length + 1)], of: path, below: dir.replace(/[\\/][^\\/]*$/, '') }
+  const loaded = (await $.fs.ancestors(request).catch(() => []))[0]?.parts[0]?.content
+  if (loaded !== undefined) return loaded
+  const content = await $.fs.read(path).catch(() => undefined)
+  return typeof content === 'string' ? content : undefined
 }
 
 async function homeOf($: EngineInterface): Promise<string | undefined> {
@@ -83,8 +98,8 @@ async function discover($: EngineInterface): Promise<PinnedFile[]> {
   if (userDir !== undefined) {
     const path = `${userDir}/CLAUDE.md`
     const mtimeMs = await mtimeOf($, path)
-    const content = mtimeMs === undefined ? undefined : await $.fs.read(path).catch(() => undefined)
-    if (mtimeMs !== undefined && typeof content === 'string') {
+    const content = mtimeMs === undefined ? undefined : await textOf($, path)
+    if (mtimeMs !== undefined && content !== undefined) {
       found.push({ path, kind: 'user', content, mtimeMs })
     }
   }
@@ -226,17 +241,15 @@ async function sync($: EngineInterface): Promise<void> {
     const mtimeMs = await mtimeOf($, file.path)
     if (mtimeMs === undefined) {
       removed.push(file.path)
-      gone.push(file)
       continue
     }
     if (mtimeMs === file.mtimeMs) {
       files.push(file)
       continue
     }
-    const content = await $.fs.read(file.path).catch(() => undefined)
-    if (typeof content !== 'string') {
+    const content = await textOf($, file.path)
+    if (content === undefined) {
       removed.push(file.path)
-      gone.push(file)
       continue
     }
     if (content.trim() !== file.content.trim()) edited.push(file.path)
@@ -266,8 +279,8 @@ async function sync($: EngineInterface): Promise<void> {
   ].join('; ')
   // Raw text can't be patched per file: once the disk moves, pin what is on disk.
   const next: Pin = { files, raw: null, source: pin.source === 'engine' ? 'engine' : 'discovered' }
+  // No toast: what reaches Claude is toasted when it's sent.
   await settle($, next, pin.source === null ? undefined : change)
-  if (pin.source !== null) $.ui.toast('CLAUDE.md changed')
 }
 
 /**
@@ -330,29 +343,55 @@ async function age($: EngineInterface): Promise<void> {
 }
 
 /**
- * The hidden block for the message being sent: every pinned file whose whole text, as it is on
- * disk now, isn't in the conversation as Claude reads it (counting what Claude Code is about to
- * give it), and every pinned file deleted since whose old text is. Null when Claude has them all.
+ * The hidden block for the message being sent: every file whose latest copy in the conversation, as
+ * Claude reads it (counting what Claude Code is about to give it), isn't its whole text as it is on
+ * disk now. That's each pinned file, and each CLAUDE.md Claude still has a copy of though it's
+ * unpinned or deleted: one deleted or emptied is reported removed. Null when Claude has them all.
  */
 async function missing($: EngineInterface, turnId: string | undefined): Promise<string | null> {
   const pin = await read($, pinAtom)
   const sameTurn = turnId !== undefined && sentMidTurn?.turnId === turnId ? sentMidTurn.blocks : []
-  const context = contextOf(await $.session.messages({ as: 'api' }), [...announced, ...sameTurn])
+  const copies = copiesOf(await $.session.messages({ as: 'api' }), [...announced, ...sameTurn])
   announced = []
-  const isPinned = (file: PinnedFile) => pin.files.some(f => keyOf(f.path) === keyOf(file.path))
-  const removed = gone.filter(f => !isPinned(f) && isHeld(f.content, context))
-  gone = []
+
+  const files: PinnedFile[] = []
+  const removed: string[] = []
+  // Files Claude has an older copy of: edited since.
+  const edited = new Set<string>()
+  const check = async (file: PinnedFile) => {
+    const copy = lastCopy(file.path, copies)
+    // A Read or a Write shows Claude the file as it is on disk, comments and all.
+    const raw = await $.fs.read(file.path).catch(() => undefined)
+    if (isHeld(file.content, copy, typeof raw === 'string' ? raw : file.content)) return
+    if (file.content.trim() === '') removed.push(file.path)
+    else files.push(file)
+    if (copy !== null) edited.add(file.path)
+  }
   // Text another plugin rewrote stands for the startup files until they change on disk.
-  const files = (pin.source === 'raw' ? pin.files.filter(f => f.scope !== undefined) : pin.files).filter(f => !isHeld(f.content, context))
+  for (const file of pin.source === 'raw' ? pin.files.filter(f => f.scope !== undefined) : pin.files) await check(file)
+  for (const path of copiedPaths(copies)) {
+    if (pin.files.some(f => keyOf(f.path) === keyOf(path))) continue
+    const content = await textOf($, path)
+    // Any file deleted is reported removed; a subfolder's CLAUDE.md still there is kept current.
+    if (content === undefined || isSubfolderName(path)) await check(unpinnedFile(path, content ?? ''))
+  }
   const block = blockOf(files, removed)
   if (block === null) return null
   if (turnId !== undefined) sentMidTurn = { turnId, blocks: [...sameTurn, block] }
 
   const places = await placesOf($)
-  const names = [...files.map(f => displayPath(f.path, places)), ...removed.map(f => `${displayPath(f.path, places)} (removed)`)]
+  const changed = files.filter(f => edited.has(f.path)).map(f => displayPath(f.path, places))
+  const sent = [
+    ...files.filter(f => !edited.has(f.path)).map(f => displayPath(f.path, places)),
+    ...removed.map(path => `${displayPath(path, places)} (removed)`),
+  ]
+  const text = [
+    ...(changed.length > 0 ? [`Edited and sent to Claude: ${changed.join(', ')}`] : []),
+    ...(sent.length > 0 ? [`Sent to Claude: ${sent.join(', ')}`] : []),
+  ].join('; ')
   const turn = await read($, turnAtom)
-  await update($, changeAtom, () => ({ text: `Sent to Claude: ${names.join(', ')}`, turn }))
-  $.ui.toast(`CLAUDE.md sent to Claude: ${names.join(', ')}`)
+  await update($, changeAtom, () => ({ text, turn }))
+  $.ui.toast(`CLAUDE.md ${text[0]?.toLowerCase()}${text.slice(1)}`)
   return block
 }
 
@@ -439,7 +478,7 @@ export const register: Register = on => {
     const context = await next(e)
     const block = context.blocks.find(b => b.name === 'claudeMd')
     const instructionFiles = context.instructionFiles ?? []
-    announced = block === undefined ? [] : [block.text, ...instructionFiles.map(f => f.content)]
+    announced = block === undefined ? [] : instructionFiles.map(f => `Contents of ${f.path}:\n\n${f.content}`)
     // No block (none on disk, or a subagent that omits it): leave the pin as is;
     // sync notices deletions by itself.
     if (block === undefined || block.text.trim() === '') return context
