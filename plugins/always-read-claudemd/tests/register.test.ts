@@ -304,7 +304,7 @@ test('an edit made outside Claude Code is sent with the next message, in full, a
   await send('hello')
   add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
-  // Nothing checks the disk while you're idle, however long: only sending a message does.
+  // Nothing is sent while you're idle, however long: only with a message.
   write(PROJECT_MD, 'Use spaces.\nRun the tests first.')
   await clock.advance(60_000)
   expect(toasts).toEqual([])
@@ -529,6 +529,54 @@ test('a deleted rules file or @import Claude Code loaded is reported removed too
     `# CLAUDE.md\n\nRemoved: ${RULES_MD}. Its instructions no longer apply.\n\nRemoved: ${IMPORT_MD}. Its instructions no longer apply.`,
   )
   expect(await send()).toBeUndefined()
+})
+
+test('a chat that opens shows its files on the line before any message, and sends nothing', async ($, on) => {
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_400_000)
+  engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, start } = conversation($, on)
+
+  await start()
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const line = await $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })
+    expect(await line.find({ text: 'CLAUDE.md pinned' })).toBeDefined()
+    await line.unmount()
+  }
+  expect(chat.blocks).toEqual([])
+  expect(toasts).toEqual([])
+})
+
+test('the line looks at the disk once a second, and only the line: nothing is pinned or sent', async ($, on) => {
+  const { clock, toasts, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_450_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  const lines = await Promise.all(
+    (['terminal', 'desktop'] as const).map(surface => $.ui.mount({ plugin: 'always-read-claudemd', surface, ...LINE[surface] })),
+  )
+  for (const line of lines) expect(await line.find({ text: /^1 file, ~/ })).toBeDefined()
+
+  // A CLAUDE.md created while you're idle shows within a second.
+  write(LOCAL_MD, 'My local rule.')
+  await clock.advance(1000)
+  for (const line of lines) expect(await line.find({ text: /^2 files, ~/ })).toBeDefined()
+
+  // Every one deleted: the line says so within a second.
+  remove(PROJECT_MD)
+  remove(LOCAL_MD)
+  await clock.advance(1000)
+  for (const line of lines) expect(await line.find({ text: 'No CLAUDE.md found' })).toBeDefined()
+
+  // What is pinned, and what Claude is sent, wait for your message.
+  expect(await pinned($)).toEqual([PROJECT_MD])
+  expect(chat.blocks).toEqual([])
+  expect(toasts).toEqual([])
+  write(LOCAL_MD, 'My local rule.')
+  await send()
+  expect(chat.blocks.at(-1)).toContain('My local rule.')
+  expect(chat.blocks.at(-1)).toContain(`Removed: ${PROJECT_MD}.`)
+  for (const line of lines) await line.unmount()
 })
 
 test('with no CLAUDE.md anywhere nothing is sent', async ($, on) => {

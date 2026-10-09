@@ -75,8 +75,9 @@ Chats from versions before 0.9.0 may hold the `CLAUDE.md` message those versions
 ### Where it looks for files
 
 - **At startup:** whatever Claude Code itself loads. That's `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md`), plus `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working directory and every folder above it, and files such as `.claude/rules/*.md`. All of them are pinned, top-level folder first.
-- **At each of your messages:** every pinned file is read again, and the user-level and parent-folder locations are checked for new files. This is the only check that decides what Claude is sent. There's no timer and no file watching: while you're idle, nothing runs.
-- **When you open the pane, press a file in it, or go back to the list:** the files are read from disk right then, so the pane shows them as they are now. The line under the prompt shows what was read last, at your last message or the last time you looked in the pane.
+- **At each of your messages:** every pinned file is read again, and the user-level and parent-folder locations are checked for new files. This is the only check that decides what Claude is sent, and nothing is sent while you're idle.
+- **For the line, as a chat opens and then once a second:** the files are checked on disk, so the line shows them as they are now. A `CLAUDE.md` created, edited or deleted while you're idle shows within a second, and the line has them before your first message, though the desktop app doesn't load its `CLAUDE.md` until you send one. This check only feeds the line, and only while it's shown: it pins nothing and decides nothing about what Claude is sent. That waits for your next message.
+- **When you open the pane, press a file in it, or go back to the list:** the files are read from disk right then, so the pane shows them as they are now.
 - **Symlinks:** a `CLAUDE.md` that is a symbolic link, say to an `AGENTS.md`, is read through the link, so editing `AGENTS.md` counts as editing the `CLAUDE.md` itself.
 - **Subfolders:** a subfolder's `CLAUDE.md` is pinned once Claude opens a file in that folder (Read, Edit, Write, MultiEdit or NotebookEdit). Only folders Claude actually works in are pinned, so the rest of the repo costs nothing.
 
@@ -192,7 +193,7 @@ The plugin lives in `plugins/always-read-claudemd/`; the repository root holds t
 
 | Path | Contents |
 | --- | --- |
-| `hooks/register.tsx` | Hooks: capturing the files Claude Code loaded, reading files through Claude Code's loader, checking the conversation at each message and attaching the hidden block, re-syncing from disk, subfolder pins, the band and the pane |
+| `hooks/register.tsx` | Hooks: capturing the files Claude Code loaded, reading files through Claude Code's loader, checking the conversation at each message and attaching the hidden block, re-syncing from disk, subfolder pins, the band and the pane, and the line's once-a-second look at the disk |
 | `hooks/pin.ts` | Pure helpers: the hidden block, finding each file's latest copy in the conversation, paths, token estimates |
 | `tests/register.test.ts` | Tests |
 | `types/index.d.ts` | Types for the values the plugin keeps between reloads |

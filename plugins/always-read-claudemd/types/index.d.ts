@@ -29,6 +29,12 @@ export type Pin = {
   source: 'engine' | 'discovered' | 'raw' | null
 }
 
+/**
+ * What the line's once-a-second look at the disk found since the files were pinned: files edited or
+ * created, as they are now, and the paths of ones deleted. Only the band and the status line read it.
+ */
+export type OnDisk = { found: PinnedFile[]; gone: string[] }
+
 /** The latest change to what is pinned, as the pane words it. */
 export type PinChange = { text: string; turn: number }
 
@@ -39,6 +45,7 @@ declare module 'claude-code' {
       /** User messages sent this session; subfolder pins age by it. */
       turn: number
       lastChange: PinChange | null
+      onDisk: OnDisk
       isBandShown: boolean
       /** The file the pane shows read-only (its path, or `raw` for rewritten text); null for the list. */
       viewing: string | null
