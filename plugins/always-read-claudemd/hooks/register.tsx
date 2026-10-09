@@ -908,7 +908,7 @@ export const register: Register = on => {
   // The pane closing, by /claudemd or its own close mark or key: a toast says so.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     const closed = await next(e)
-    $.ui.toast('CLAUDE.md pane closed')
+    $.ui.toast('CLAUDE.md pane closed; /claudemd opens it again.')
     return closed
   })
 
