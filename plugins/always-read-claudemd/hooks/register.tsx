@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { ClientElements, EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { Pin, PinnedFile } from '../types'
+import type { OnDisk, Pin, PinnedFile } from '../types'
 import {
   FILE_TOOLS,
   PROJECT_NAMES,
   TIERS,
   UNPIN_AFTER,
+  asOnDisk,
   blockOf,
   copiedPaths,
   copiesOf,
@@ -45,6 +46,8 @@ const changeAtom = atom({ plugin: 'always-read-claudemd', key: 'lastChange' } as
 const bandAtom = atom({ plugin: 'always-read-claudemd', key: 'isBandShown' } as const, true)
 const viewingAtom = atom({ plugin: 'always-read-claudemd', key: 'viewing' } as const, null)
 const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as const, 0)
+const NOTHING_MOVED: OnDisk = { found: [], gone: [] }
+const diskAtom = atom({ plugin: 'always-read-claudemd', key: 'onDisk' } as const, NOTHING_MOVED)
 
 /**
  * The CLAUDE.md text Claude Code is about to give Claude with the next message: it reads its files
@@ -229,10 +232,11 @@ async function settleView($: EngineInterface, pin: Pin) {
 const describe = (verb: string, paths: string[], places: { root?: string; home?: string }) =>
   `${verb} ${paths.map(p => displayPath(p, places)).join(', ')}`
 
-/** Re-checks the pinned files against disk: re-reads any whose mtime moved, drops deleted ones, and adds new ones. */
-async function sync($: EngineInterface): Promise<void> {
-  const pin = await read($, pinAtom)
-
+/**
+ * The pinned files as they are on disk now: any whose mtime moved re-read, deleted ones dropped,
+ * and new ones added. Changes nothing; says what moved.
+ */
+async function onDisk($: EngineInterface, pin: Pin) {
   const edited: string[] = []
   const removed: string[] = []
   const added: string[] = []
@@ -263,6 +267,13 @@ async function sync($: EngineInterface): Promise<void> {
     files.push(file)
     added.push(file.path)
   }
+  return { files, edited, removed, added }
+}
+
+/** Re-checks the pinned files against disk and pins them as they are now. */
+async function sync($: EngineInterface): Promise<void> {
+  const pin = await read($, pinAtom)
+  const { files, edited, removed, added } = await onDisk($, pin)
 
   const hasChanged = edited.length + removed.length + added.length > 0
   if (!hasChanged && pin.source !== null) {
@@ -281,6 +292,28 @@ async function sync($: EngineInterface): Promise<void> {
   const next: Pin = { files, raw: null, source: pin.source === 'engine' ? 'engine' : 'discovered' }
   // No toast: what reaches Claude is toasted when it's sent.
   await settle($, next, pin.source === null ? undefined : change)
+}
+
+// Whether the line's look at the disk is under way: one at a time.
+let isLooking = false
+
+/**
+ * The line's own look at the disk, as the chat opens and once a second: the files edited, created
+ * or deleted since they were pinned, so the band and the status line show them as they are now.
+ * Only the line reads what it finds: what is pinned, and what Claude is sent, are decided at each
+ * message alone.
+ */
+async function look($: EngineInterface): Promise<void> {
+  if (isLooking || !(await read($, bandAtom))) return
+  isLooking = true
+  try {
+    const { files, edited, removed, added } = await onDisk($, await read($, pinAtom))
+    const moved = new Set([...edited, ...added])
+    const disk: OnDisk = { found: files.filter(f => moved.has(f.path)), gone: removed }
+    if (JSON.stringify(disk) !== JSON.stringify(await read($, diskAtom))) await update($, diskAtom, () => disk)
+  } finally {
+    isLooking = false
+  }
 }
 
 /**
@@ -452,6 +485,9 @@ export const register: Register = on => {
       description: 'Open or close the pane showing what CLAUDE.md is pinned; "/claudemd band" shows or hides its line',
     }).catch(() => undefined)
     await followBand($)
+    // The line looks at the disk as the chat opens and then once a second (see look).
+    await look($).catch(() => undefined)
+    $.clock.every(1000, () => void look($).catch(() => undefined))
 
     return started
   })
@@ -547,7 +583,7 @@ export const register: Register = on => {
     const hint = await next(e)
     if (e.surface !== 'terminal' || !(await read($, bandAtom))) return hint
     const { Box, Text } = $.ui.resolve(e)
-    const line = lineOf(await read($, pinAtom), await read($, turnAtom))
+    const line = lineOf(asOnDisk(await read($, pinAtom), await read($, diskAtom)), await read($, turnAtom))
 
     return (
       <Box flexDirection="column">
@@ -570,7 +606,7 @@ export const register: Register = on => {
     const others = await next(e)
     const hasOthers = !isBlank(others)
     const { Box, Button, Text } = $.ui.resolve(e)
-    const line = lineOf(await read($, pinAtom), await read($, turnAtom))
+    const line = lineOf(asOnDisk(await read($, pinAtom), await read($, diskAtom)), await read($, turnAtom))
     // The band names the first two subfolder files, or one when it's narrow, and counts the rest,
     // which the pane lists. What fits its width: fewer folders first, then no summary. The desktop
     // draws its buttons as keys in boxes.

@@ -1,4 +1,4 @@
-import type { Pin, PinnedFile } from '../types'
+import type { OnDisk, Pin, PinnedFile } from '../types'
 
 // Where an instruction file can appear in a directory.
 export const PROJECT_NAMES = ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md']
@@ -219,6 +219,19 @@ export function copiedPaths(copies: readonly Copy[]): string[] {
 export function unpinnedFile(path: string, content: string): PinnedFile {
   const scope = path.replace(/[\\/][^\\/]*$/, '').replace(/[\\/]\.claude$/i, '')
   return { path, kind: /CLAUDE\.local\.md$/i.test(path) ? 'local' : 'project', content, mtimeMs: -1, scope }
+}
+
+/**
+ * The pin as the band and the status line show it: with what their look at the disk found, edited
+ * and created files as they are now and deleted ones left out, as the next message will pin them.
+ */
+export function asOnDisk(pin: Pin, disk: OnDisk): Pin {
+  if (disk.found.length + disk.gone.length === 0) return pin
+  const gone = new Set(disk.gone.map(keyOf))
+  const found = new Map(disk.found.map(f => [keyOf(f.path), f]))
+  const files = pin.files.flatMap(f => (gone.has(keyOf(f.path)) ? [] : [{ ...f, content: found.get(keyOf(f.path))?.content ?? f.content }]))
+  const added = disk.found.filter(f => !pin.files.some(p => keyOf(p.path) === keyOf(f.path)))
+  return { files: [...files, ...added], raw: null, source: pin.source === 'engine' ? 'engine' : 'discovered' }
 }
 
 /** How many files the pin carries, as the band and status line count them. */
