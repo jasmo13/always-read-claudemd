@@ -467,7 +467,8 @@ async function openPane($: EngineInterface) {
   await sync($).catch(() => undefined)
   await update($, viewingAtom, () => null)
   await update($, paneTopAtom, () => 0)
-  await $.ui.open({ id: PANE, title: TITLE })
+  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  if (opened.isPlaced) $.ui.toast('CLAUDE.md pane opened')
 }
 
 // /claudemd: opens the pane, or closes it when it's open. The terminal has no band, so no Details
@@ -902,6 +903,13 @@ export const register: Register = on => {
       </Box>,
       bodyRows,
     )
+  })
+
+  // The pane closing, by /claudemd or its own close mark or key: a toast says so.
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const closed = await next(e)
+    $.ui.toast('CLAUDE.md pane closed; /claudemd opens it again.')
+    return closed
   })
 
   // The wheel and scroll keys over the pane move its body; the top above it stays put.
