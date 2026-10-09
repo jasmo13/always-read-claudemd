@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { InstructionFile, On, RenderElement, PromptContextInput, SessionMessage, UiPane } from 'claude-code'
 
-import { bandLayout, blockOf, contextOf, displayPath, isBlank, isHeld, isMessage, scrollBar, scrolled, tabTitle } from '../hooks/pin'
+import { bandLayout, blockOf, copiesOf, displayPath, isBlank, isHeld, isMessage, lastCopy, scrollBar, scrolled, tabTitle } from '../hooks/pin'
 
 const HOME = 'C:/home'
 const PROJECT = 'C:/work/app'
@@ -77,7 +77,9 @@ function world(on: On, files: Record<string, string>, now: number, links: Record
       e.names.flatMap(name => {
         const file = disk.get(keyOf(`${dir}/${name}`))
         if (file === undefined) return []
-        return [{ dir, name, content: file.content, parts: [{ path: file.path, content: file.content }] }]
+        // Claude Code's loader leaves HTML comments out: here, a line of one.
+        const content = file.content.replace(/^<!--.*-->\n?/gm, '')
+        return [{ dir, name, content, parts: [{ path: file.path, content }] }]
       }),
     )
     return { value: found } as never
@@ -137,6 +139,9 @@ function engine(on: On, files: InstructionFile[] | null, options: { rewrittenAs?
 
 /** How Claude Code puts a block a prompt.submit hook attached into the message Claude reads. */
 const hidden = (block: string) => `<system-reminder>\nprompt.submit hook additional context: ${block}\n</system-reminder>`
+
+/** How Claude Code gives Claude text of its own, its CLAUDE.md copies among it. */
+const reminder = (text: string) => `<system-reminder>\n${text}\n</system-reminder>`
 
 /**
  * The chat beneath the plugin, as Claude reads it (`$.session.messages({ as: 'api' })`): each
@@ -244,7 +249,7 @@ test('a new chat: Claude Code gives Claude its CLAUDE.md, and the plugin adds no
   await start()
   // Claude Code adds its copy to the first message after the plugin's hooks run: it isn't sent twice.
   expect(await send('hello')).toBeUndefined()
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Always use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Always use tabs.')))
   expect(await send()).toBeUndefined()
   expect(chat.swaps).toBe(0)
   // The system prompt is Claude Code's own.
@@ -297,17 +302,17 @@ test('an edit made outside Claude Code is sent with the next message, in full, a
   await $.prompt.context(input)
   await start()
   await send('hello')
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
   // Nothing checks the disk while you're idle, however long: only sending a message does.
   write(PROJECT_MD, 'Use spaces.\nRun the tests first.')
   await clock.advance(60_000)
-  expect(toasts).not.toContain('CLAUDE.md changed')
+  expect(toasts).toEqual([])
   const block = await send()
-  expect(toasts).toContain('CLAUDE.md changed')
   expect(block?.startsWith('# CLAUDE.md\n\nThese are the user\'s CLAUDE.md instructions, exactly as they are on disk now.')).toBe(true)
   expect(block).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.\nRun the tests first.'))
-  expect(toasts).toContain(`CLAUDE.md sent to Claude: ${PROJECT_MD}`)
+  // One toast, and only when something is sent.
+  expect(toasts).toEqual([`CLAUDE.md edited and sent to Claude: ${PROJECT_MD}`])
 
   // It's part of that message from then on, so Claude can go back to it, and it isn't sent again.
   expect(await send()).toBeUndefined()
@@ -317,7 +322,8 @@ test('an edit made outside Claude Code is sent with the next message, in full, a
 
   // The pane says what was sent.
   const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
-  expect(await pane.find({ text: `Sent to Claude: ${PROJECT_MD}` })).toBeDefined()
+  expect(await pane.find({ text: `Edited and sent to Claude: ${PROJECT_MD}` })).toBeDefined()
+  expect(toasts).toHaveLength(1)
   await pane.unmount()
 })
 
@@ -351,7 +357,7 @@ test("Claude's own Write holds the whole file; an Edit, which shows Claude a sni
   await $.prompt.context(input)
   await start()
   await send('hello')
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
   const rules = 'Use spaces.\nRun the tests first.\nKeep commits small.'
   write(PROJECT_MD, rules)
@@ -362,6 +368,73 @@ test("Claude's own Write holds the whole file; an Edit, which shows Claude a sni
   write(PROJECT_MD, edited)
   tool('Edit', { file_path: PROJECT_MD, old_string: 'Use spaces.', new_string: 'Use both.' }, `The file ${PROJECT_MD} has been updated. Here's a snippet:\n     1\tUse both.`)
   expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, edited))
+})
+
+test('a line deleted from either end, or edits by both you and Claude, send the file as it is now', async ($, on) => {
+  const rules = 'Use tabs.\nRun the tests first.'
+  const { write } = world(on, { [PROJECT_MD]: rules }, 3_600_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: rules }])
+  const { send, add, tool, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, rules)))
+  expect(await send()).toBeUndefined()
+
+  // Claude's copy holds the shorter file, but has more in it: it isn't the file.
+  write(PROJECT_MD, 'Use tabs.')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  write(PROJECT_MD, rules)
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, rules))
+  write(PROJECT_MD, 'Run the tests first.')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Run the tests first.'))
+
+  // Claude writes the file, then you edit it: the file is neither, so it's sent.
+  write(PROJECT_MD, 'Rule A.')
+  tool('Write', { file_path: PROJECT_MD, content: 'Rule A.' }, `File created successfully at: ${PROJECT_MD}`)
+  write(PROJECT_MD, 'Rule A.\nRule B.')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Rule A.\nRule B.'))
+
+  // You edit it, then Claude writes over your edit: the file is what Claude wrote.
+  write(PROJECT_MD, 'Rule C.')
+  write(PROJECT_MD, 'Rule D.')
+  tool('Write', { file_path: PROJECT_MD, content: 'Rule D.' }, `File created successfully at: ${PROJECT_MD}`)
+  expect(await send()).toBeUndefined()
+
+  // Claude's Edit adds a line, then you delete it: the snippet and the copy sent after it both
+  // have the file's text in them, and neither is the file.
+  write(PROJECT_MD, 'Rule D.\nRule E.')
+  tool('Edit', { file_path: PROJECT_MD, old_string: 'Rule D.', new_string: 'Rule D.\nRule E.' }, `The file ${PROJECT_MD} has been updated.`)
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Rule D.\nRule E.'))
+  write(PROJECT_MD, 'Rule D.')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Rule D.'))
+  expect(await send()).toBeUndefined()
+})
+
+test('a subfolder CLAUDE.md unpinned while Claude still has a copy is kept current', async ($, on) => {
+  const { write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.', [API_MD]: 'Validate every endpoint.' }, 3_700_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { send, add, start, turn } = conversation($, on)
+  tools(on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
+  await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
+  add(reminder(`Contents of ${API_MD}:\n\nValidate every endpoint.`))
+  for (let i = 0; i < 10; i++) expect(await send()).toBeUndefined()
+  expect(await pinned($)).not.toContain(API_MD)
+
+  // Edited while unpinned: Claude's copy is out of date, so the new text is sent. It stays unpinned.
+  write(API_MD, 'Validate every endpoint.\nLog every error.')
+  expect(await send()).toContain(copyOf(API_MD, `subfolder instructions; apply when working in ${PROJECT}/api`, 'Validate every endpoint.\nLog every error.'))
+  expect(await send()).toBeUndefined()
+  expect(await pinned($)).not.toContain(API_MD)
+
+  // Deleted: reported removed, once.
+  remove(API_MD)
+  expect(await send()).toBe(`# CLAUDE.md\n\nRemoved: ${API_MD}. Its instructions no longer apply.`)
+  expect(await send()).toBeUndefined()
 })
 
 test('a file Claude read in full counts, line numbers and all; part of one does not', async ($, on) => {
@@ -393,12 +466,12 @@ test('a compaction drops a subfolder CLAUDE.md: the next message brings it back'
   await $.prompt.context(input)
   await start()
   await send('hello')
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
   // Claude opens a file in api/: the folder's CLAUDE.md is pinned, and Claude Code gives Claude a copy.
   await turn(() => $.tool.call({ tool: 'Read', tool_use_id: 't1', file_path: API_FILE }))
   expect(toasts.some(t => t.startsWith('CLAUDE.md pinned:'))).toBe(true)
-  add(`Contents of ${API_MD}:\n\nValidate every endpoint.`)
+  add(reminder(`Contents of ${API_MD}:\n\nValidate every endpoint.`))
   expect(await send()).toBeUndefined()
 
   // A compaction: Claude Code gives the startup files again, not the subfolder's.
@@ -408,26 +481,53 @@ test('a compaction drops a subfolder CLAUDE.md: the next message brings it back'
   expect(block).toContain(copyOf(API_MD, `subfolder instructions; apply when working in ${keyOf(PROJECT)}/api`, 'Validate every endpoint.'))
   expect(block).not.toContain('Use tabs.')
   // Claude Code adds its own copy of the startup files to that message, after the plugin's hooks.
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
   expect(await send()).toBeUndefined()
 })
 
 test('a new CLAUDE.md is sent; a deleted one Claude still has is reported removed, once', async ($, on) => {
-  const { write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_000_000)
+  const { toasts, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_000_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
   const { send, add, start } = conversation($, on)
   await $.prompt.context(input)
   await start()
   await send('hello')
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
   // Created where nothing was watched: found when the message is sent.
   write(LOCAL_MD, 'My local rule.')
   expect(await send()).toContain(copyOf(LOCAL_MD, "user's private project instructions, not checked in", 'My local rule.'))
+  expect(toasts.at(-1)).toBe(`CLAUDE.md sent to Claude: ${LOCAL_MD}`)
 
   remove(LOCAL_MD)
   const block = await send()
-  expect(block).toBe(`# CLAUDE.md\n\nRemoved: ${LOCAL_MD} (user's private project instructions, not checked in). Its instructions no longer apply.`)
+  expect(block).toBe(`# CLAUDE.md\n\nRemoved: ${LOCAL_MD}. Its instructions no longer apply.`)
+  expect(toasts.at(-1)).toBe(`CLAUDE.md sent to Claude: ${LOCAL_MD} (removed)`)
+  expect(await send()).toBeUndefined()
+  expect(toasts).toHaveLength(2)
+})
+
+test('a deleted rules file or @import Claude Code loaded is reported removed too', async ($, on) => {
+  const RULES_MD = `${PROJECT}/.claude/rules/style.md`
+  const IMPORT_MD = `${PROJECT}/docs/conventions.md`
+  const { remove } = world(on, { [PROJECT_MD]: 'Use tabs.\n@docs/conventions.md', [RULES_MD]: 'Short names.', [IMPORT_MD]: 'Small commits.' }, 5_500_000)
+  const files: InstructionFile[] = [
+    { path: PROJECT_MD, kind: 'project', content: 'Use tabs.\n@docs/conventions.md' },
+    { path: RULES_MD, kind: 'project', content: 'Short names.' },
+    { path: IMPORT_MD, kind: 'project', content: 'Small commits.', parent: PROJECT_MD },
+  ]
+  const input = engine(on, files)
+  const { send, add, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(reminder(files.map(f => copyOf(f.path, PROJECT_LABEL, f.content)).join('\n\n')))
+
+  remove(RULES_MD)
+  remove(IMPORT_MD)
+  expect(await send()).toBe(
+    `# CLAUDE.md\n\nRemoved: ${RULES_MD}. Its instructions no longer apply.\n\nRemoved: ${IMPORT_MD}. Its instructions no longer apply.`,
+  )
   expect(await send()).toBeUndefined()
 })
 
@@ -498,6 +598,30 @@ test('text another plugin rewrote stands for the startup files until they change
   expect(await send()).toContain('Rule B.')
 })
 
+test("a file's comments are left out as Claude Code's own loader leaves them out", async ($, on) => {
+  const { write } = world(on, { [PROJECT_MD]: 'Use tabs.\n<!-- for people -->\n' }, 7_500_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.\n' }])
+  const { send, add, tool, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  await send('hello')
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
+
+  // A comment changed: Claude's copy is still the file as Claude Code loads it.
+  write(PROJECT_MD, 'Use tabs.\n<!-- for the team -->\n')
+  expect(await send()).toBeUndefined()
+  // A rule added: the file is sent as Claude Code loads it.
+  write(PROJECT_MD, 'Use tabs.\n<!-- for the team -->\nRun the tests.\n')
+  expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.\nRun the tests.'))
+  // Claude read the whole file, comment and all: it has it.
+  write(PROJECT_MD, 'Use spaces.\n<!-- for the team -->\n')
+  tool('Read', { file_path: PROJECT_MD }, '1\tUse spaces.\n2\t<!-- for the team -->\n3')
+  expect(await send()).toBeUndefined()
+  // Nothing but a comment left: to Claude, it's removed.
+  write(PROJECT_MD, '<!-- for the team -->\n')
+  expect(await send()).toContain(`Removed: ${PROJECT_MD}. Its instructions no longer apply.`)
+})
+
 test('the hidden block holds each file whole, under a heading naming where it is and what it is', () => {
   const block = blockOf([
     { path: USER_MD, kind: 'user', content: 'Answer briefly.\n', mtimeMs: 1 },
@@ -514,14 +638,35 @@ test('the hidden block holds each file whole, under a heading naming where it is
   )
   expect(blockOf([])).toBeNull()
 
-  // Found in what Claude reads: whole, with Windows line endings, without its HTML comments, or numbered.
+  // Claude's latest copy of a file must be its whole text as it is now: as Claude Code loads it, or
+  // as it is on disk. Windows line endings and Read's line numbers don't count as differences.
+  const loaded = 'Use tabs.\r\nRun the tests.'
   const rules = 'Use tabs.\r\n<!-- for the team -->\r\nRun the tests.'
-  expect(isHeld(rules, contextOf([{ role: 'user', content: 'Use tabs.\n<!-- for the team -->\nRun the tests.' }]))).toBe(true)
-  expect(isHeld(rules, contextOf([], ['Use tabs.\n\nRun the tests.']))).toBe(true)
-  expect(isHeld(rules, contextOf([], ['Use tabs.']))).toBe(false)
-  expect(isHeld(rules, contextOf([{ role: 'user', content: [{ type: 'tool_result', content: '1\tUse tabs.\n2\t<!-- for the team -->\n3\tRun the tests.' }] }]))).toBe(true)
-  expect(isHeld(rules, contextOf([{ role: 'assistant', content: [{ type: 'thinking', thinking: rules }] }]))).toBe(false)
-  expect(isHeld('', contextOf([]))).toBe(true)
+  const latest = (...messages: unknown[]) => lastCopy(PROJECT_MD, copiesOf(messages))
+  const given = (path: string, text: string) => ({ role: 'user', content: reminder(copyOf(path, PROJECT_LABEL, text)) })
+  const read = (input: Record<string, unknown>, result: string) => [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'Read', input }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: result }] },
+  ]
+  expect(isHeld(loaded, latest(given(PROJECT_MD, 'Use tabs.\n\nRun the tests.')), rules)).toBe(false)
+  expect(isHeld(loaded, latest(given(PROJECT_MD, 'Use tabs.\nRun the tests.')), rules)).toBe(true)
+  expect(isHeld(loaded, latest(...read({ file_path: PROJECT_MD }, '1\tUse tabs.\n2\t<!-- for the team -->\n3\tRun the tests.\n4\n\n<system-reminder>\nA note.\n</system-reminder>')), rules)).toBe(true)
+
+  // A copy with more in it than the file isn't the file: a line deleted from either end since.
+  expect(isHeld('Use tabs.', latest(given(PROJECT_MD, 'Use tabs.\nRun the tests.')))).toBe(false)
+  expect(isHeld('Run the tests.', latest(given(PROJECT_MD, 'Use tabs.\nRun the tests.')))).toBe(false)
+  // Only the latest copy counts.
+  expect(isHeld('Use tabs.', latest(given(PROJECT_MD, 'Use tabs.'), given(PROJECT_MD, 'Use spaces.')))).toBe(false)
+  // Not copies of this file: another file's, a part of it read, the text quoted outside a reminder, Claude's thinking.
+  expect(isHeld('Use tabs.', latest(given(API_MD, 'Use tabs.')))).toBe(false)
+  expect(isHeld('Use tabs.\nRun the tests.', latest(...read({ file_path: PROJECT_MD, offset: 1, limit: 1 }, '1\tUse tabs.')))).toBe(false)
+  expect(isHeld('Use tabs.', latest({ role: 'user', content: copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.') }))).toBe(false)
+  expect(isHeld('Use tabs.', latest({ role: 'assistant', content: [{ type: 'thinking', thinking: reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')) }] }))).toBe(false)
+
+  // An empty file is held when Claude has no text of it, or was told it was removed.
+  expect(isHeld('', latest())).toBe(true)
+  expect(isHeld('', latest(given(PROJECT_MD, 'Use tabs.')))).toBe(false)
+  expect(isHeld('', latest(given(PROJECT_MD, 'Use tabs.'), { role: 'user', content: hidden(blockOf([], [PROJECT_MD]) ?? '') }))).toBe(true)
 })
 
 test('unpins a subfolder CLAUDE.md after 10 messages without work there', async ($, on) => {
@@ -987,11 +1132,11 @@ test('a CLAUDE.md that links to AGENTS.md is read through the link', async ($, o
   await $.prompt.context(input)
   await start()
   await send('hello')
-  add(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.'))
+  add(reminder(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use tabs.')))
 
   // Only AGENTS.md is edited: CLAUDE.md, read through the link, has changed with it.
   write(AGENTS_MD, 'Use spaces.')
   expect(await send()).toContain(copyOf(PROJECT_MD, PROJECT_LABEL, 'Use spaces.'))
-  expect(toasts).toContain('CLAUDE.md changed')
+  expect(toasts).toEqual([`CLAUDE.md edited and sent to Claude: ${PROJECT_MD}`])
   expect(chat.swaps).toBe(0)
 })
