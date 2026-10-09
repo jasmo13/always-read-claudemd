@@ -468,7 +468,7 @@ async function openPane($: EngineInterface) {
   await update($, viewingAtom, () => null)
   await update($, paneTopAtom, () => 0)
   const opened = await $.ui.open({ id: PANE, title: TITLE })
-  if (opened.isPlaced) $.ui.toast('CLAUDE.md pane opened')
+  if (opened.isPlaced) $.ui.toast('CLAUDE.md pane opened.')
 }
 
 // /claudemd: opens the pane, or closes it when it's open. The terminal has no band, so no Details

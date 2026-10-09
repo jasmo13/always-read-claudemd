@@ -924,7 +924,7 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
 
   expect((await run()).text).toBeUndefined()
   expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
-  expect(toasts).toEqual(['CLAUDE.md pane opened'])
+  expect(toasts).toEqual(['CLAUDE.md pane opened.'])
 
   const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
   await pane.press({ key: `open:${keyOf(PROJECT_MD)}` })
@@ -935,7 +935,7 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
   await run()
   expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
   expect(await pane.find({ type: 'Markdown' })).toBeUndefined()
-  expect(toasts).toEqual(['CLAUDE.md pane opened', 'CLAUDE.md pane closed; /claudemd opens it again.', 'CLAUDE.md pane opened'])
+  expect(toasts).toEqual(['CLAUDE.md pane opened.', 'CLAUDE.md pane closed; /claudemd opens it again.', 'CLAUDE.md pane opened.'])
   await pane.unmount()
 })
 
