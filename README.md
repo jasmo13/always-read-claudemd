@@ -145,6 +145,7 @@ Apart from the hidden block, the plugin never writes to the chat; everything it 
 
 - it sends Claude a file;
 - it pins or unpins a subfolder file;
+- you open or close the pane: *CLAUDE.md pane opened*, *CLAUDE.md pane closed*;
 - you hide or show the line.
 
 There's no refresh button: opening the pane or a file in it reads the files from disk. **Hide band** (`h`) / **Show band** (`s`) in the pane hides or shows the line, and so does `/claudemd band`, with a toast: *CLAUDE.md line hidden*. Your choice is kept for every chat, new or old, until you change it. Chats that are already open follow it at their next message.

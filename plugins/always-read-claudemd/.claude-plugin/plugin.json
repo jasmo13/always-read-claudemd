@@ -1,6 +1,6 @@
 {
   "name": "always-read-claudemd",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Sends your CLAUDE.md, word for word, as a hidden part of your next message whenever Claude doesn't have its current text: after an edit made outside Claude Code, or a compaction that dropped a subfolder's file. It never compacts a chat or changes the system prompt.",
   "author": { "name": "Jake Campbell" },
   "license": "MIT",

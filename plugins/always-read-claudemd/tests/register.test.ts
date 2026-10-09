@@ -912,7 +912,7 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
     return { value: undefined } as never
   })
   on('ui.panes', () => ({ value: [...panes] }) as never)
-  world(on, { [PROJECT_MD]: 'Use tabs.' }, 14_000_000)
+  const { toasts } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 14_000_000)
   await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
   const run = () =>
     $.command.run({
@@ -924,6 +924,7 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
 
   expect((await run()).text).toBeUndefined()
   expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
+  expect(toasts).toEqual(['CLAUDE.md pane opened'])
 
   const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
   await pane.press({ key: `open:${keyOf(PROJECT_MD)}` })
@@ -934,6 +935,7 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
   await run()
   expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
   expect(await pane.find({ type: 'Markdown' })).toBeUndefined()
+  expect(toasts).toEqual(['CLAUDE.md pane opened', 'CLAUDE.md pane closed', 'CLAUDE.md pane opened'])
   await pane.unmount()
 })
 
