@@ -30,8 +30,8 @@ export type Pin = {
 }
 
 /**
- * What the line's once-a-second look at the disk found since the files were pinned: files edited or
- * created, as they are now, and the paths of ones deleted. Only the band and the status line read it.
+ * What the once-a-second look at the disk found since the files were pinned: files edited or created,
+ * as they are now, and the paths of ones deleted. Only the band, the status line and the pane read it.
  */
 export type OnDisk = { found: PinnedFile[]; gone: string[] }
 

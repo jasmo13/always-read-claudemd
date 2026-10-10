@@ -546,7 +546,7 @@ test('a chat that opens shows its files on the line before any message, and send
   expect(toasts).toEqual([])
 })
 
-test('the line looks at the disk once a second, and only the line: nothing is pinned or sent', async ($, on) => {
+test('the line looks at the disk once a second, and only the line and the pane: nothing is pinned or sent', async ($, on) => {
   const { clock, toasts, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 5_450_000)
   const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
   const { chat, send, start } = conversation($, on)
@@ -568,8 +568,10 @@ test('the line looks at the disk once a second, and only the line: nothing is pi
   await clock.advance(1000)
   for (const line of lines) expect(await line.find({ text: 'No CLAUDE.md found' })).toBeDefined()
 
-  // What is pinned, and what Claude is sent, wait for your message.
-  expect(await pinned($)).toEqual([PROJECT_MD])
+  // What is pinned, and what Claude is sent, wait for your message: no change to the pin yet.
+  const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
+  expect(await pane.find({ text: 'Last change' })).toBeUndefined()
+  await pane.unmount()
   expect(chat.blocks).toEqual([])
   expect(toasts).toEqual([])
   write(LOCAL_MD, 'My local rule.')
@@ -880,7 +882,7 @@ test('the pane opens a file read-only and goes back to the list', async ($, on) 
   }
 })
 
-test('opening a file in the pane reads it from disk, with no watcher and no timer', async ($, on) => {
+test('opening a file in the pane reads it from disk first', async ($, on) => {
   const { write } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 13_500_000)
   await $.prompt.context(engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }]))
 
@@ -895,6 +897,66 @@ test('opening a file in the pane reads it from disk, with no watcher and no time
   await pane.press({ key: 'back' })
   expect(await pane.find({ text: LOCAL_MD })).toBeDefined()
   await pane.unmount()
+})
+
+test('an open pane follows the disk once a second, with the line hidden too: nothing is pinned or sent', async ($, on) => {
+  // The panes Claude Code has open, retitled by each later open, as the engine would.
+  const panes: UiPane[] = []
+  const titles: string[] = []
+  on('ui.open', (_$, e) => {
+    titles.push(e.title ?? '')
+    const pane = { id: e.id, title: e.title ?? '', isShown: true, isFocused: true, isPlaced: true }
+    const at = panes.findIndex(p => p.id === e.id)
+    if (at >= 0) panes[at] = pane
+    else panes.push(pane)
+    return { value: { isPlaced: true } } as never
+  })
+  on('ui.panes', () => ({ value: [...panes] }) as never)
+  const { clock, toasts, write, remove } = world(on, { [PROJECT_MD]: 'Use tabs.' }, 13_700_000)
+  const input = engine(on, [{ path: PROJECT_MD, kind: 'project', content: 'Use tabs.' }])
+  const { chat, send, start } = conversation($, on)
+  await $.prompt.context(input)
+  await start()
+  const run = (args: string) =>
+    $.command.run({ command: 'claudemd', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+  await run('band')
+  await run('')
+  const views = await Promise.all(
+    (['terminal', 'desktop'] as const).map(surface => $.ui.mount({ plugin: 'always-read-claudemd', surface, ...PANE })),
+  )
+  await views[1]!.press({ key: `open:${keyOf(PROJECT_MD)}` })
+  for (const view of views) expect((await view.find({ type: 'Markdown' }))?.text).toBe('Use tabs.')
+  expect(titles.at(-1)).toBe(`${PROJECT}/CLAUDE.md: This project, shared with the team (~3 tokens, read-only)`)
+
+  // Edited while it's open: the open file, its size and the desktop's tab title follow within a second.
+  write(PROJECT_MD, 'Use spaces, never tabs, in every file.')
+  await clock.advance(1000)
+  for (const view of views) {
+    expect((await view.find({ type: 'Markdown' }))?.text).toBe('Use spaces, never tabs, in every file.')
+    expect(await view.find({ text: '~10 tokens, read-only' })).toBeDefined()
+  }
+  expect(titles.at(-1)).toBe(`${PROJECT}/CLAUDE.md: This project, shared with the team (~10 tokens, read-only)`)
+
+  // Created while it's open: listed within a second. Deleted while it's open: back to the list.
+  write(LOCAL_MD, 'My local rule.')
+  remove(PROJECT_MD)
+  await clock.advance(1000)
+  for (const view of views) {
+    expect(await view.find({ type: 'Markdown' })).toBeUndefined()
+    expect(await view.find({ text: LOCAL_MD })).toBeDefined()
+    expect(await view.find({ text: PROJECT_MD })).toBeUndefined()
+    expect(await view.find({ text: /^1 file pinned/ })).toBeDefined()
+  }
+  expect(titles.at(-1)).toBe('CLAUDE.md')
+
+  // What is pinned, and what Claude is sent, wait for your message.
+  expect(await views[0]!.find({ text: 'Last change' })).toBeUndefined()
+  expect(chat.blocks).toEqual([])
+  expect(toasts).toEqual(['CLAUDE.md line hidden', 'CLAUDE.md pane opened.'])
+  await send()
+  expect(chat.blocks.at(-1)).toContain('My local rule.')
+  expect(chat.blocks.at(-1)).toContain(`Removed: ${PROJECT_MD}.`)
+  for (const view of views) await view.unmount()
 })
 
 test('/claudemd opens the pane on the list, and closes it when it is open', async ($, on) => {

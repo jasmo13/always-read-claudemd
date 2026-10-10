@@ -41,6 +41,7 @@ const BAND_KEY = 'isBandShown'
 
 /** Opens or retitles the pane. Each open sets Escape anew, so every one asks that it closes the pane, as other panes do. */
 const showPane = ($: EngineInterface, title: string) => $.ui.open({ id: PANE, title, closeOnEscape: true })
+const isPaneOpen = async ($: EngineInterface) => (await $.ui.panes()).some(pane => pane.id === PANE)
 
 const EMPTY: Pin = { files: [], raw: null, source: null }
 const pinAtom = atom({ plugin: 'always-read-claudemd', key: 'pin' } as const, EMPTY)
@@ -51,6 +52,9 @@ const viewingAtom = atom({ plugin: 'always-read-claudemd', key: 'viewing' } as c
 const paneTopAtom = atom({ plugin: 'always-read-claudemd', key: 'paneTop' } as const, 0)
 const NOTHING_MOVED: OnDisk = { found: [], gone: [] }
 const diskAtom = atom({ plugin: 'always-read-claudemd', key: 'onDisk' } as const, NOTHING_MOVED)
+
+/** What the line and the pane show: the pinned files as the last look at the disk found them (see look). */
+const shownPin = async ($: EngineInterface) => asOnDisk(await read($, pinAtom), await read($, diskAtom))
 
 /**
  * The CLAUDE.md text Claude Code is about to give Claude with the next message: it reads its files
@@ -194,7 +198,7 @@ async function settle($: EngineInterface, pin: Pin, change?: string) {
     const turn = await read($, turnAtom)
     await update($, changeAtom, () => ({ text: change, turn }))
   }
-  await settleView($, pin).catch(() => undefined)
+  await settleView($).catch(() => undefined)
 }
 
 /** Where a file comes from, as the open file's view and its tab title say it. */
@@ -209,7 +213,7 @@ const RAW_DETAIL = 'As another plugin rewrote it'
  */
 async function titleFor($: EngineInterface, viewing: string | null): Promise<string> {
   if (viewing === null) return TITLE
-  const pin = await read($, pinAtom)
+  const pin = await shownPin($)
   if (viewing === RAW && pin.source === 'raw') return tabTitle(TITLE, RAW_DETAIL, tokensOf(pin.raw ?? ''))
   const file = pin.files.find(f => keyOf(f.path) === viewing)
   return file === undefined
@@ -218,12 +222,13 @@ async function titleFor($: EngineInterface, viewing: string | null): Promise<str
 }
 
 /**
- * The pin changed while the pane shows a file: back to the list if the file is gone, and a tab
- * title that names a file (the desktop's) kept to what the pane shows.
+ * The pin, or what the look at the disk found, changed while the pane shows a file: back to the list
+ * if the file is gone, and a tab title that names a file (the desktop's) kept to what the pane shows.
  */
-async function settleView($: EngineInterface, pin: Pin) {
+async function settleView($: EngineInterface) {
   const viewing = await read($, viewingAtom)
   if (viewing === null) return
+  const pin = await shownPin($)
   const isGone = !(viewing === RAW && pin.source === 'raw') && !pin.files.some(f => keyOf(f.path) === viewing)
   if (isGone) await update($, viewingAtom, () => null)
   const pane = (await $.ui.panes()).find(p => p.id === PANE)
@@ -277,11 +282,14 @@ async function onDisk($: EngineInterface, pin: Pin) {
 async function sync($: EngineInterface): Promise<void> {
   const pin = await read($, pinAtom)
   const { files, edited, removed, added } = await onDisk($, pin)
+  // Once the pin is the disk as it is now, what the last look found is spent.
+  const spend = () => update($, diskAtom, () => NOTHING_MOVED)
 
   const hasChanged = edited.length + removed.length + added.length > 0
   if (!hasChanged && pin.source !== null) {
     // Same text, but a file read back from the chat's message now has its mtime.
     if (files.some((f, i) => f !== pin.files[i])) await update($, pinAtom, () => ({ ...pin, files }))
+    await spend()
     return
   }
 
@@ -295,25 +303,29 @@ async function sync($: EngineInterface): Promise<void> {
   const next: Pin = { files, raw: null, source: pin.source === 'engine' ? 'engine' : 'discovered' }
   // No toast: what reaches Claude is toasted when it's sent.
   await settle($, next, pin.source === null ? undefined : change)
+  await spend()
 }
 
-// Whether the line's look at the disk is under way: one at a time.
+// Whether the look at the disk is under way: one at a time.
 let isLooking = false
 
 /**
- * The line's own look at the disk, as the chat opens and once a second: the files edited, created
- * or deleted since they were pinned, so the band and the status line show them as they are now.
- * Only the line reads what it finds: what is pinned, and what Claude is sent, are decided at each
- * message alone.
+ * The line's and the pane's own look at the disk, as the chat opens and once a second while either
+ * is shown: the files edited, created or deleted since they were pinned, so the band, the status line
+ * and the pane show them as they are now. Only they read what it finds: what is pinned, and what
+ * Claude is sent, are decided at each message alone.
  */
 async function look($: EngineInterface): Promise<void> {
-  if (isLooking || !(await read($, bandAtom))) return
+  if (isLooking) return
   isLooking = true
   try {
+    if (!(await read($, bandAtom)) && !(await isPaneOpen($))) return
     const { files, edited, removed, added } = await onDisk($, await read($, pinAtom))
     const moved = new Set([...edited, ...added])
     const disk: OnDisk = { found: files.filter(f => moved.has(f.path)), gone: removed }
-    if (JSON.stringify(disk) !== JSON.stringify(await read($, diskAtom))) await update($, diskAtom, () => disk)
+    if (JSON.stringify(disk) === JSON.stringify(await read($, diskAtom))) return
+    await update($, diskAtom, () => disk)
+    await settleView($)
   } finally {
     isLooking = false
   }
@@ -466,7 +478,7 @@ function markdownRows(markdown: string, columns: number): number {
 
 /** Opens the pane on its list of files, as they are on disk now; an open pane is left as it is. */
 async function openPane($: EngineInterface) {
-  if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
+  if (await isPaneOpen($)) return
   await sync($).catch(() => undefined)
   await update($, viewingAtom, () => null)
   await update($, paneTopAtom, () => 0)
@@ -477,7 +489,7 @@ async function openPane($: EngineInterface) {
 // /claudemd: opens the pane, or closes it when it's open. The terminal has no band, so no Details
 // button; the command is the way in and out.
 async function togglePane($: EngineInterface) {
-  if ((await $.ui.panes()).some(pane => pane.id === PANE)) await $.ui.close({ id: PANE })
+  if (await isPaneOpen($)) await $.ui.close({ id: PANE })
   else await openPane($)
 }
 
@@ -489,7 +501,7 @@ export const register: Register = on => {
       description: 'Open or close the pane showing what CLAUDE.md is pinned; "/claudemd band" shows or hides its line',
     }).catch(() => undefined)
     await followBand($)
-    // The line looks at the disk as the chat opens and then once a second (see look).
+    // The line and the pane look at the disk as the chat opens and then once a second (see look).
     await look($).catch(() => undefined)
     $.clock.every(1000, () => void look($).catch(() => undefined))
 
@@ -587,7 +599,7 @@ export const register: Register = on => {
     const hint = await next(e)
     if (e.surface !== 'terminal' || !(await read($, bandAtom))) return hint
     const { Box, Text } = $.ui.resolve(e)
-    const line = lineOf(asOnDisk(await read($, pinAtom), await read($, diskAtom)), await read($, turnAtom))
+    const line = lineOf(await shownPin($), await read($, turnAtom))
 
     return (
       <Box flexDirection="column">
@@ -610,7 +622,7 @@ export const register: Register = on => {
     const others = await next(e)
     const hasOthers = !isBlank(others)
     const { Box, Button, Text } = $.ui.resolve(e)
-    const line = lineOf(asOnDisk(await read($, pinAtom), await read($, diskAtom)), await read($, turnAtom))
+    const line = lineOf(await shownPin($), await read($, turnAtom))
     // The band names the first two subfolder files, or one when it's narrow, and counts the rest,
     // which the pane lists. What fits its width: fewer folders first, then no summary. The desktop
     // draws its buttons as keys in boxes.
@@ -646,7 +658,8 @@ export const register: Register = on => {
   // so the toolbar stays put. Rows are cut to fit rather than wrapped; color carries state only.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Markdown, Text } = $.ui.resolve(e)
-    const pin = await read($, pinAtom)
+    // As the last look at the disk found the files: an open file follows its edits within a second.
+    const pin = await shownPin($)
     const turn = await read($, turnAtom)
     const lastChange = await read($, changeAtom)
     const isBandShown = await read($, bandAtom)
