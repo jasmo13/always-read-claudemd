@@ -900,7 +900,9 @@ test('opening a file in the pane reads it from disk, with no watcher and no time
 test('/claudemd opens the pane on the list, and closes it when it is open', async ($, on) => {
   // The panes Claude Code has open, as the engine would list them.
   const panes: UiPane[] = []
+  const escapes: (boolean | undefined)[] = []
   on('ui.open', (_$, e) => {
+    escapes.push(e.closeOnEscape)
     if (!panes.some(p => p.id === e.id)) {
       panes.push({ id: e.id, title: e.title ?? '', isShown: true, isFocused: true, isPlaced: true })
     }
@@ -925,6 +927,8 @@ test('/claudemd opens the pane on the list, and closes it when it is open', asyn
   expect((await run()).text).toBeUndefined()
   expect(panes.map(p => p.id)).toEqual(['always-read-claudemd'])
   expect(toasts).toEqual(['CLAUDE.md pane opened.'])
+  // Escape closes it too, as other panes.
+  expect(escapes).toEqual([true])
 
   const pane = await $.ui.mount({ plugin: 'always-read-claudemd', surface: 'terminal', ...PANE })
   await pane.press({ key: `open:${keyOf(PROJECT_MD)}` })
@@ -1013,8 +1017,10 @@ test("on the desktop the open file's name, where it comes from and its size stay
   // The pane Claude Code has open, retitled by each later open, as the engine would.
   const panes: UiPane[] = [{ id: 'always-read-claudemd', title: 'CLAUDE.md', isShown: true, isFocused: true, isPlaced: true }]
   const titles: string[] = []
+  const escapes: (boolean | undefined)[] = []
   on('ui.open', (_$, e) => {
     titles.push(e.title ?? '')
+    escapes.push(e.closeOnEscape)
     panes[0] = { ...panes[0]!, title: e.title ?? '' }
     return { value: { isPlaced: true } } as never
   })
@@ -1052,6 +1058,9 @@ test("on the desktop the open file's name, where it comes from and its size stay
   expect(titles[titles.length - 1]).toBe('CLAUDE.md')
   expect(await pane.find({ type: 'Markdown' })).toBeUndefined()
   await pane.unmount()
+  // Each open sets Escape anew: a new title keeps it closing the pane.
+  expect(escapes.length).toBe(titles.length)
+  expect(escapes.every(e => e === true)).toBe(true)
 
   expect(tabTitle('~/.claude/CLAUDE.md', 'Yours, for every project', 1200)).toBe('~/.claude/CLAUDE.md: Yours, for every project (~1.2k tokens, read-only)')
   // Under the home folder, a file's location starts with ~, in forward slashes.
