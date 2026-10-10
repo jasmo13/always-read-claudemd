@@ -139,7 +139,7 @@ The pane's frame and background come from Claude Code's theme. If the pane looks
 
 Every file is named by where it is, with `~` for your home folder, so a project's file says which project it's in. Press a file's name to read it, or its number (`1`–`9`) in the terminal. The pane shows that file read-only, as it is on disk now and as Claude gets it, without HTML comments, with **Back** (`b`) in the top row to return to the list. Where the file comes from and its size sit above the line, so what scrolls is the file itself.
 
-`/claudemd` opens the pane, on the list of files, or closes it when it's open. Pinning runs in the background either way.
+`/claudemd` opens the pane, on the list of files, or closes it when it's open. **Esc** closes it too, as it does other panes, while the pane has the keyboard. Pinning runs in the background either way.
 
 Apart from the hidden block, the plugin never writes to the chat; everything it reports is a toast. It shows one only when:
 

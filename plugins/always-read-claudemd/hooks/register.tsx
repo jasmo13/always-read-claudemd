@@ -39,6 +39,9 @@ const TITLE = 'CLAUDE.md'
 const COMMAND = 'claudemd'
 const BAND_KEY = 'isBandShown'
 
+/** Opens or retitles the pane. Each open sets Escape anew, so every one asks that it closes the pane, as other panes do. */
+const showPane = ($: EngineInterface, title: string) => $.ui.open({ id: PANE, title, closeOnEscape: true })
+
 const EMPTY: Pin = { files: [], raw: null, source: null }
 const pinAtom = atom({ plugin: 'always-read-claudemd', key: 'pin' } as const, EMPTY)
 const turnAtom = atom({ plugin: 'always-read-claudemd', key: 'turn' } as const, 0)
@@ -226,7 +229,7 @@ async function settleView($: EngineInterface, pin: Pin) {
   const pane = (await $.ui.panes()).find(p => p.id === PANE)
   if (pane === undefined || pane.title === TITLE) return
   const title = await titleFor($, isGone ? null : viewing)
-  if (title !== pane.title) await $.ui.open({ id: PANE, title })
+  if (title !== pane.title) await showPane($, title)
 }
 
 const describe = (verb: string, paths: string[], places: { root?: string; home?: string }) =>
@@ -467,7 +470,7 @@ async function openPane($: EngineInterface) {
   await sync($).catch(() => undefined)
   await update($, viewingAtom, () => null)
   await update($, paneTopAtom, () => 0)
-  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  const opened = await showPane($, TITLE)
   if (opened.isPlaced) $.ui.toast('CLAUDE.md pane opened.')
 }
 
@@ -666,7 +669,7 @@ export const register: Register = on => {
         await update($, viewingAtom, () => id)
         await update($, paneTopAtom, () => 0)
         await sync($).catch(() => undefined)
-        if (!isFixed) await $.ui.open({ id: PANE, title: await titleFor($, id) })
+        if (!isFixed) await showPane($, await titleFor($, id))
       })().catch(() => undefined)
 
     // The toolbar and its rule: drawn above the scrolled body, so they never move.
@@ -905,7 +908,7 @@ export const register: Register = on => {
     )
   })
 
-  // The pane closing, by /claudemd or its own close mark or key: a toast says so.
+  // The pane closing, by /claudemd, its own close mark or key, or Escape: a toast says so.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     const closed = await next(e)
     $.ui.toast('CLAUDE.md pane closed; /claudemd opens it again.')
